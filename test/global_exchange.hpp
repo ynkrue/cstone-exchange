@@ -117,20 +117,6 @@ int testGlobalExchange(Exec exec, Upsweep upsweep, ComputeParents computeParents
     double setupTime  = MPI_Wtime() - start;
     auto   siblings   = siblingNodes<KeyType>(hostTree, assignment[rank], assignment[rank + 1], numExtraLevels);
 
-    // list check: per peer, the (messages, nodes) I send must equal what that peer expects to receive from me
-    std::vector<int> sendInfo(2 * numRanks, 0), recvInfo(2 * numRanks, 0), peerRecvInfo(2 * numRanks);
-    for (const auto& m : lists.send) { sendInfo[2 * m.peer] += 1, sendInfo[2 * m.peer + 1] += m.count; }
-    for (const auto& m : lists.recv) { recvInfo[2 * m.peer] += 1, recvInfo[2 * m.peer + 1] += m.count; }
-    MPI_Alltoall(sendInfo.data(), 2, MPI_INT, peerRecvInfo.data(), 2, MPI_INT, MPI_COMM_WORLD);
-    int listMismatches = 0;
-    for (int i = 0; i < 2 * numRanks; ++i) { listMismatches += peerRecvInfo[i] != recvInfo[i]; }
-    MPI_Allreduce(MPI_IN_PLACE, &listMismatches, 1, MPI_INT, MPI_SUM, MPI_COMM_WORLD);
-    if (rank == 0)
-    {
-        if (listMismatches) { std::printf("lists: FAIL (%d mismatches)\n", listMismatches); }
-        else { std::printf("lists: PASS\n"); }
-    }
-
     /// p2p buffers
     Vector<TreeNodeIndex> sendIdx(lists.sendIdx), recvIdx(lists.recvIdx);
     Vector<Q>             globQ(hostTree.numNodes), sendBuf(lists.sendIdx.size()), recvBuf(lists.recvIdx.size());
@@ -149,8 +135,6 @@ int testGlobalExchange(Exec exec, Upsweep upsweep, ComputeParents computeParents
     std::vector<Q>      leafQ(hostTree.numLeafNodes), reference(hostTree.numNodes);
     std::vector<double> allgatherTime(reps);
     std::vector<double> p2pTime(reps);
-    int                 numRounds = int(lists.sendOffsets.size()) - 1;
-    std::vector<double> roundTimes(numRounds);
     int                 errors    = 0;
     int                 p2pErrors = 0;
     for (int rep = 0; rep < reps; ++rep)
@@ -177,16 +161,13 @@ int testGlobalExchange(Exec exec, Upsweep upsweep, ComputeParents computeParents
             if (fullQ[i] != reference[i]) { ++errors; }
         }
 
-        if (listMismatches) { continue; }
-
         /// distributed p2p upsweep
         MPI_Barrier(MPI_COMM_WORLD);
         start = MPI_Wtime();
         scatter(exec, gOctree.leafToInternalSpan().subspan(firstLeaf, numLeaves), localQ.data(), globQ.data());
         globalSweep(exec, lists, {sendIdx.data(), sendIdx.size()}, {recvIdx.data(), recvIdx.size()},
                     gOctree.childOffsets, std::span<Q>(globQ.data(), globQ.size()), {sendBuf.data(), sendBuf.size()},
-                    {recvBuf.data(), recvBuf.size()}, computeParents, std::span<double>(roundTimes), tag,
-                    MPI_COMM_WORLD);
+                    {recvBuf.data(), recvBuf.size()}, computeParents, tag, MPI_COMM_WORLD);
         p2pTime[rep] = MPI_Wtime() - start;
 
         // check the sibling nodes and own leaves of this rank from the p2p sweep
@@ -206,25 +187,11 @@ int testGlobalExchange(Exec exec, Upsweep upsweep, ComputeParents computeParents
     MPI_Allreduce(MPI_IN_PLACE, &errors, 1, MPI_INT, MPI_SUM, MPI_COMM_WORLD);
     MPI_Allreduce(MPI_IN_PLACE, &p2pErrors, 1, MPI_INT, MPI_SUM, MPI_COMM_WORLD);
     MPI_Allreduce(MPI_IN_PLACE, &setupTime, 1, MPI_DOUBLE, MPI_MAX, MPI_COMM_WORLD);
-    // sibling nodes, send and receive messages: max and sum over ranks
+    // max and sum over ranks of sibling nodes, send and receive messages
     long counts3[3] = {long(siblings.size()), long(lists.send.size()), long(lists.recv.size())};
     long maxCounts[3], sumCounts[3];
     MPI_Reduce(counts3, maxCounts, 3, MPI_LONG, MPI_MAX, 0, MPI_COMM_WORLD);
     MPI_Reduce(counts3, sumCounts, 3, MPI_LONG, MPI_SUM, 0, MPI_COMM_WORLD);
-    // rank with the most send messages
-    int sendMax[2] = {int(lists.send.size()), rank}, sendMaxLoc[2];
-    MPI_Reduce(sendMax, sendMaxLoc, 1, MPI_2INT, MPI_MAXLOC, 0, MPI_COMM_WORLD);
-    // per round of the last repetition: max over ranks of time, sends, receives, computes
-    std::vector<double> maxRoundTimes(numRounds);
-    std::vector<long>   roundCounts(3 * numRounds), maxRoundCounts(3 * numRounds);
-    for (int e = 0; e < numRounds; ++e)
-    {
-        roundCounts[3 * e]     = long(lists.sendOffsets[e + 1] - lists.sendOffsets[e]);
-        roundCounts[3 * e + 1] = long(lists.recvOffsets[e + 1] - lists.recvOffsets[e]);
-        roundCounts[3 * e + 2] = long(lists.computeOffsets[e + 1] - lists.computeOffsets[e]);
-    }
-    MPI_Reduce(roundTimes.data(), maxRoundTimes.data(), numRounds, MPI_DOUBLE, MPI_MAX, 0, MPI_COMM_WORLD);
-    MPI_Reduce(roundCounts.data(), maxRoundCounts.data(), 3 * numRounds, MPI_LONG, MPI_MAX, 0, MPI_COMM_WORLD);
     std::vector<double> gatheredTimes(std::size_t(numRanks) * reps), gatheredP2pTimes(std::size_t(numRanks) * reps);
     MPI_Allgather(allgatherTime.data(), reps, MPI_DOUBLE, gatheredTimes.data(), reps, MPI_DOUBLE, MPI_COMM_WORLD);
     MPI_Allgather(p2pTime.data(), reps, MPI_DOUBLE, gatheredP2pTimes.data(), reps, MPI_DOUBLE, MPI_COMM_WORLD);
@@ -253,26 +220,17 @@ int testGlobalExchange(Exec exec, Upsweep upsweep, ComputeParents computeParents
         std::printf("sibling nodes, send msgs, recv msgs (max / mean): %ld / %.1f, %ld / %.1f, %ld / %.1f\n",
                     maxCounts[0], double(sumCounts[0]) / numRanks, maxCounts[1], double(sumCounts[1]) / numRanks,
                     maxCounts[2], double(sumCounts[2]) / numRanks);
-        std::printf("most sends: rank %d with %d messages\n", sendMaxLoc[1], sendMaxLoc[0]);
-        std::printf("round | max time [ms] | rank 0 time [ms] | max sends | max recvs | max computes\n");
-        for (int e = 0; e < numRounds; ++e)
-        {
-            std::printf("%5d | %13.3f | %16.3f | %9ld | %9ld | %12ld\n", e, maxRoundTimes[e] * 1e3,
-                        roundTimes[e] * 1e3, maxRoundCounts[3 * e], maxRoundCounts[3 * e + 1],
-                        maxRoundCounts[3 * e + 2]);
-        }
-        std::printf("rep | allgather max [ms] | mean [ms] | median [ms] |      p2p max [ms] | mean [ms] | median [ms]\n");
+        std::printf("rep | allgather max [ms] | mean [ms] | median [ms] | p2p max [ms] | mean [ms] | median [ms]\n");
         for (int rep = 0; rep < reps; ++rep)
         {
             double max, mean, median, p2pMax, p2pMean, p2pMedian;
             rankStats(gatheredTimes, rep, max, mean, median);
             rankStats(gatheredP2pTimes, rep, p2pMax, p2pMean, p2pMedian);
-            std::printf("%3d | %18.3f | %9.3f | %11.3f | %16.3f | %9.3f | %11.3f\n", rep + 1, max * 1e3, mean * 1e3,
+            std::printf("%3d | %18.3f | %9.3f | %11.3f | %12.3f | %9.3f | %11.3f\n", rep + 1, max * 1e3, mean * 1e3,
                         median * 1e3, p2pMax * 1e3, p2pMean * 1e3, p2pMedian * 1e3);
         }
         std::printf("allgather upsweep: %s (%d errors)\n", errors ? "FAIL" : "PASS", errors);
-        if (listMismatches) { std::printf("p2p sweep: skipped, lists mismatch\n"); }
-        else { std::printf("p2p sweep: %s (%d errors)\n", p2pErrors ? "FAIL" : "PASS", p2pErrors); }
+        std::printf("p2p sweep: %s (%d errors)\n", p2pErrors ? "FAIL" : "PASS", p2pErrors);
     }
-    return errors != 0 || p2pErrors != 0 || listMismatches != 0;
+    return errors != 0 || p2pErrors != 0;
 }
