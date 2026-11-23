@@ -18,15 +18,17 @@
 #include <algorithm>
 #include <bit>
 #include <cassert>
-#include <cstdint>
 #include <span>
 #include <vector>
 #include <mpi.h>
 
 #include "cstone/cuda/cuda_utils.hpp"
+#include "cstone/domain/domaindecomp.hpp"
 #include "cstone/primitives/mpi_wrappers.hpp"
 #include "cstone/primitives/primitives_acc.hpp"
-#include "cstone/traversal/macs.hpp"
+#include "cstone/sfc/common.hpp"
+#include "cstone/traversal/boxoverlap.hpp"
+#include "cstone/tree/octree.hpp"
 
 namespace global_sweep
 {
@@ -42,51 +44,31 @@ struct SweepMessage
     TreeNodeIndex offset, count;
 };
 
-/*! @brief find the far nodes of every rank
- *
- * @tparam KeyType         SFC key type
- * @tparam T               floating point type of the box and node centers
- * @param[in]  gOctree     global octree
- * @param[in]  gLeaves     global cornerstone leaves
- * @param[in]  treeOffsets first global leaf of each rank
- * @param[in]  centers     MAC centers and squared radii of all global nodes
- * @param[in]  box         global coordinate bounding box
- * @param[out] farOffsets  P + 1 offsets into @p farNodes
- * @param[out] farNodes    far nodes of rank r in [farOffsets[r], farOffsets[r + 1])
- */
-template<class KeyType, class T>
-void computeFarNodes(OctreeView<const KeyType> gOctree,
-                     std::span<const KeyType> gLeaves,
-                     std::span<const TreeNodeIndex> treeOffsets,
-                     std::span<const Vec4<T>> centers,
-                     const Box<T>& box,
-                     std::vector<TreeNodeIndex>& farOffsets,
-                     std::vector<TreeNodeIndex>& farNodes)
+//! @brief nodes of the rank owning [start, end): children of its ancestors that do not overlap it, refined
+//! numExtraLevels deeper, leaves kept where the tree ends earlier
+template<class KeyType>
+std::vector<TreeNodeIndex> siblingNodes(OctreeView<const KeyType> tree, KeyType start, KeyType end, int numExtraLevels)
 {
-    int numRanks = int(treeOffsets.size()) - 1;
-    farOffsets.assign(numRanks + 1, 0);
-    farNodes.clear();
-
-    for (int r = 0; r < numRanks; ++r)
+    std::vector<TreeNodeIndex> nodes;
+    for (TreeNodeIndex i = 1; i < tree.numNodes; ++i)
     {
-        KeyType focusStart = gLeaves[treeOffsets[r]];
-        KeyType focusEnd   = gLeaves[treeOffsets[r + 1]];
+        KeyType key   = decodePlaceholderBit(tree.prefixes[i]);
+        int     level = decodePrefixLength(tree.prefixes[i]) / 3;
 
-        std::vector<uint8_t> flags(gOctree.numNodes);
-        markMacs(gOctree.prefixes, gOctree.childOffsets, gOctree.parents, centers.data(), box,
-                 gLeaves.data() + treeOffsets[r], treeOffsets[r + 1] - treeOffsets[r], false, flags.data());
-
-        // parent of node c is stored at parents[(c - 1) / 8]
-        for (TreeNodeIndex c = 1; c < gOctree.numNodes; ++c)
+        // base: level of the coarsest ancestor of i that does not overlap [start, end), level + 1 if i overlaps
+        int base = 1;
+        for (; base <= level; ++base)
         {
-            if (flags[gOctree.parents[(c - 1) / 8]] && !flags[c] &&
-                !containedIn(gOctree.prefixes[c], focusStart, focusEnd))
-            {
-                farNodes.push_back(c);
-            }
+            KeyType a = enclosingBoxCode(key, base);
+            if (a >= end || a + nodeRange<KeyType>(base) <= start) { break; }
         }
-        farOffsets[r + 1] = farNodes.size();
+        int depth = level - base;
+        if (depth >= 0 && (tree.childOffsets[i] == 0 ? depth <= numExtraLevels : depth == numExtraLevels))
+        {
+            nodes.push_back(i);
+        }
     }
+    return nodes;
 }
 
 //! @brief number of rank index bits owned by rounds 1..@p round (1-based), for 1, 2 or 4 leaves per rank
@@ -94,32 +76,34 @@ inline int lowBits(int leavesPerRank, int round) { return 3 * round - std::count
 
 /*! @brief true if @p rank computes its level lam - 1 node in @p round, lam = L - round + 1
  *
- * True iff that node or one of its ancestors is a far node of a rank that has the same lowest
+ * True iff that node or one of its ancestors is a needed node of a rank that has the same lowest
  * lowBits(round) rank index bits as @p rank.
  *
- * @param[in] gOctree,gLeaves,treeOffsets,farOffsets,farNodes  see computeFarNodes
- * @param[in] rank        rank that computes
- * @param[in] round       1-based round, 1..L
+ * @param[in] tree         global tree
+ * @param[in] assignment   SFC range of every rank
+ * @param[in] needOffsets  P + 1 offsets into @p needNodes
+ * @param[in] needNodes    needed nodes of rank r in [needOffsets[r], needOffsets[r + 1])
+ * @param[in] rank         rank that computes
+ * @param[in] round        1-based round, 1..L
  */
 template<class KeyType>
-bool computesParent(OctreeView<const KeyType> gOctree,
-                    std::span<const KeyType> gLeaves,
-                    std::span<const TreeNodeIndex> treeOffsets,
-                    std::span<const TreeNodeIndex> farOffsets,
-                    std::span<const TreeNodeIndex> farNodes,
+bool computesParent(OctreeView<const KeyType> tree,
+                    const SfcAssignment<KeyType>& assignment,
+                    std::span<const TreeNodeIndex> needOffsets,
+                    std::span<const TreeNodeIndex> needNodes,
                     int rank,
                     int round)
 {
-    int numRanks = int(treeOffsets.size()) - 1;
-    int level    = maxDepth(gOctree.levelRange, maxTreeLevel<KeyType>{} + 2) - round;
-    int bits     = lowBits(treeOffsets[1] - treeOffsets[0], round);
+    int numRanks = assignment.numRanks();
+    int level    = maxDepth(tree.levelRange, maxTreeLevel<KeyType>{} + 2) - round;
+    int bits     = lowBits(tree.numLeafNodes / numRanks, round);
 
-    KeyType cell = encodePlaceholderBit(gLeaves[treeOffsets[rank]], 3 * level);
+    KeyType cell = encodePlaceholderBit(assignment[rank], 3 * level);
     for (int t = rank & ((1 << bits) - 1); t < numRanks; t += 1 << bits)
     {
-        for (TreeNodeIndex i = farOffsets[t]; i < farOffsets[t + 1]; ++i)
+        for (TreeNodeIndex i = needOffsets[t]; i < needOffsets[t + 1]; ++i)
         {
-            auto [nodeStart, nodeEnd] = decodePlaceholderBit2K(gOctree.prefixes[farNodes[i]]);
+            auto [nodeStart, nodeEnd] = decodePlaceholderBit2K(tree.prefixes[needNodes[i]]);
             if (containedIn(cell, nodeStart, nodeEnd)) { return true; }
         }
     }
@@ -128,48 +112,47 @@ bool computesParent(OctreeView<const KeyType> gOctree,
 
 /*! @brief nodes that rank @p src sends to rank @p dst in @p round
  *
- * Far nodes of all ranks behind @p dst that lie inside the level lam cell of @p src (lam = L - round + 1;
+ * Needed nodes of all ranks behind @p dst that lie inside the level lam cell of @p src (lam = L - round + 1;
  * for lam == L the leaves of src), plus that cell itself (all leaves of src for lam == L) if @p dst
  * computes its parent. This is the only place the exchange policy lives.
  *
- * @param[in] gOctree,gLeaves,treeOffsets,farOffsets,farNodes  see computeFarNodes
- * @param[in] src         sending rank
- * @param[in] dst         receiving rank
- * @param[in] round       1-based round, 1..L
- * @return                sorted node indices without duplicates
+ * @param[in] tree,assignment,needOffsets,needNodes  see computesParent
+ * @param[in] src          sending rank
+ * @param[in] dst          receiving rank
+ * @param[in] round        1-based round, 1..L
+ * @return                 sorted node indices without duplicates
  */
 template<class KeyType>
-std::vector<TreeNodeIndex> messageNodes(OctreeView<const KeyType> gOctree,
-                                        std::span<const KeyType> gLeaves,
-                                        std::span<const TreeNodeIndex> treeOffsets,
-                                        std::span<const TreeNodeIndex> farOffsets,
-                                        std::span<const TreeNodeIndex> farNodes,
+std::vector<TreeNodeIndex> messageNodes(OctreeView<const KeyType> tree,
+                                        const SfcAssignment<KeyType>& assignment,
+                                        std::span<const TreeNodeIndex> needOffsets,
+                                        std::span<const TreeNodeIndex> needNodes,
                                         int src,
                                         int dst,
                                         int round)
 {
-    int numRanks = int(treeOffsets.size()) - 1;
-    int level    = maxDepth(gOctree.levelRange, maxTreeLevel<KeyType>{} + 2) - round + 1;
-    int bits     = lowBits(treeOffsets[1] - treeOffsets[0], round);
+    int numRanks = assignment.numRanks();
+    int level    = maxDepth(tree.levelRange, maxTreeLevel<KeyType>{} + 2) - round + 1;
+    int bits     = lowBits(tree.numLeafNodes / numRanks, round);
 
     // level lam cell of src; for lam == L the leaves of src, which may be several level L nodes
-    KeyType cellStart = enclosingBoxCode(gLeaves[treeOffsets[src]], level);
-    KeyType cellEnd   = std::max(gLeaves[treeOffsets[src + 1]], cellStart + nodeRange<KeyType>(level));
+    KeyType cellStart = enclosingBoxCode(assignment[src], level);
+    KeyType cellEnd   = std::max(assignment[src + 1], cellStart + nodeRange<KeyType>(level));
 
     std::vector<TreeNodeIndex> nodes;
     for (int t = dst & ((1 << bits) - 1); t < numRanks; t += 1 << bits)
     {
-        for (TreeNodeIndex i = farOffsets[t]; i < farOffsets[t + 1]; ++i)
+        for (TreeNodeIndex i = needOffsets[t]; i < needOffsets[t + 1]; ++i)
         {
-            if (containedIn(gOctree.prefixes[farNodes[i]], cellStart, cellEnd)) { nodes.push_back(farNodes[i]); }
+            if (containedIn(tree.prefixes[needNodes[i]], cellStart, cellEnd)) { nodes.push_back(needNodes[i]); }
         }
     }
 
-    if (computesParent(gOctree, gLeaves, treeOffsets, farOffsets, farNodes, dst, round))
+    if (computesParent(tree, assignment, needOffsets, needNodes, dst, round))
     {
         for (KeyType key = cellStart; key < cellEnd; key += nodeRange<KeyType>(level))
         {
-            nodes.push_back(locateNode(encodePlaceholderBit(key, 3 * level), gOctree.prefixes, gOctree.levelRange));
+            nodes.push_back(locateNode(encodePlaceholderBit(key, 3 * level), tree.prefixes, tree.levelRange));
         }
     }
 
@@ -190,22 +173,32 @@ struct SweepLists
 
 /*! @brief build the send, receive and compute lists of @p myRank
  *
- * Requires P a power of two and a complete tree with 1, 2 or 4 leaves per rank.
+ * Requires P a power of two and a complete tree with 1, 2 or 4 leaves per rank. The demand of every rank is
+ * siblingNodes.
  *
- * @param[in] gOctree,gLeaves,treeOffsets,farOffsets,farNodes  see computeFarNodes
- * @param[in] myRank      rank to build the lists for
+ * @param[in] tree           global tree
+ * @param[in] assignment     SFC range of every rank
+ * @param[in] numExtraLevels see siblingNodes
+ * @param[in] myRank         rank to build the lists for
  */
 template<class KeyType>
-SweepLists createSweepLists(OctreeView<const KeyType> gOctree,
-                            std::span<const KeyType> gLeaves,
-                            std::span<const TreeNodeIndex> treeOffsets,
-                            std::span<const TreeNodeIndex> farOffsets,
-                            std::span<const TreeNodeIndex> farNodes,
+SweepLists createSweepLists(OctreeView<const KeyType> tree,
+                            const SfcAssignment<KeyType>& assignment,
+                            int numExtraLevels,
                             int myRank)
 {
-    int lpr       = treeOffsets[1] - treeOffsets[0];
-    int numRounds = maxDepth(gOctree.levelRange, maxTreeLevel<KeyType>{} + 2);
-    assert(std::has_single_bit(treeOffsets.size() - 1) && (lpr == 1 || lpr == 2 || lpr == 4));
+    int numRanks  = assignment.numRanks();
+    int lpr       = tree.numLeafNodes / numRanks;
+    int numRounds = maxDepth(tree.levelRange, maxTreeLevel<KeyType>{} + 2);
+    assert(std::has_single_bit(unsigned(numRanks)) && (lpr == 1 || lpr == 2 || lpr == 4));
+
+    std::vector<TreeNodeIndex> needOffsets(numRanks + 1, 0), needNodes;
+    for (int r = 0; r < numRanks; ++r)
+    {
+        auto nodes = siblingNodes(tree, assignment[r], assignment[r + 1], numExtraLevels);
+        needNodes.insert(needNodes.end(), nodes.begin(), nodes.end());
+        needOffsets[r + 1] = needNodes.size();
+    }
 
     SweepLists lists;
     lists.sendOffsets = lists.recvOffsets = lists.computeOffsets = {0};
@@ -221,8 +214,8 @@ SweepLists createSweepLists(OctreeView<const KeyType> gOctree,
         {
             if (peer == myRank) { continue; }
 
-            auto sendNodes = messageNodes(gOctree, gLeaves, treeOffsets, farOffsets, farNodes, myRank, peer, round);
-            auto recvNodes = messageNodes(gOctree, gLeaves, treeOffsets, farOffsets, farNodes, peer, myRank, round);
+            auto sendNodes = messageNodes(tree, assignment, needOffsets, needNodes, myRank, peer, round);
+            auto recvNodes = messageNodes(tree, assignment, needOffsets, needNodes, peer, myRank, round);
             if (!sendNodes.empty())
             {
                 lists.send.push_back({peer, TreeNodeIndex(lists.sendIdx.size()), TreeNodeIndex(sendNodes.size())});
@@ -237,10 +230,10 @@ SweepLists createSweepLists(OctreeView<const KeyType> gOctree,
         lists.sendOffsets.push_back(lists.send.size());
         lists.recvOffsets.push_back(lists.recv.size());
 
-        if (computesParent(gOctree, gLeaves, treeOffsets, farOffsets, farNodes, myRank, round))
+        if (computesParent(tree, assignment, needOffsets, needNodes, myRank, round))
         {
-            KeyType cell = encodePlaceholderBit(gLeaves[treeOffsets[myRank]], 3 * (numRounds - round));
-            lists.computeNodes.push_back(locateNode(cell, gOctree.prefixes, gOctree.levelRange));
+            KeyType cell = encodePlaceholderBit(assignment[myRank], 3 * (numRounds - round));
+            lists.computeNodes.push_back(locateNode(cell, tree.prefixes, tree.levelRange));
         }
         lists.computeOffsets.push_back(lists.computeNodes.size());
     }
@@ -261,6 +254,7 @@ SweepLists createSweepLists(OctreeView<const KeyType> gOctree,
  * @param[-]     sendBuf      send buffer, size sendIdx.size()
  * @param[-]     recvBuf      receive buffer, size recvIdx.size()
  * @param[in]    computeParents  computes the values of the given nodes from their children
+ * @param[out]   roundTimes   per round wall time after computeParents, one entry per round, may be empty
  * @param[in]    tag          MPI tag
  * @param[in]    comm         MPI communicator
  */
@@ -274,6 +268,7 @@ void globalSweep(Exec exec,
                  std::span<Q> sendBuf,
                  std::span<Q> recvBuf,
                  ComputeParents&& computeParents,
+                 std::span<double> roundTimes,
                  int tag,
                  MPI_Comm comm)
 {
@@ -292,6 +287,8 @@ void globalSweep(Exec exec,
 
     for (int e = 0; e < numRounds; ++e)
     {
+        double roundStart = MPI_Wtime();
+
         // the messages of one round are contiguous in sendIdx / recvIdx, so one gather / scatter serves them all
         auto sends = roundSlice(lists.send, lists.sendOffsets, e);
         if (!sends.empty())
@@ -316,6 +313,7 @@ void globalSweep(Exec exec,
         }
 
         computeParents(roundSlice(lists.computeNodes, lists.computeOffsets, e), childOffsets, globQ.data());
+        if (!roundTimes.empty()) { roundTimes[e] = MPI_Wtime() - roundStart; }
     }
 
     // the last scatter may still read recvBuf, which the receives of the next sweep overwrite

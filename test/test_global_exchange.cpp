@@ -15,7 +15,8 @@ int main(int argc, char** argv)
             q[n] = SumChildren{}(n, children[n], q);
         }
     };
-    int status = testGlobalExchange<std::vector>(execution::cpu, upsweep, computeParents, rank, numRanks);
+    int numExtraLevels = argc > 1 ? std::atoi(argv[1]) : 0;
+    int status = testGlobalExchange<std::vector>(execution::cpu, upsweep, computeParents, rank, numRanks, numExtraLevels);
     MPI_Finalize();
     return status;
 }
