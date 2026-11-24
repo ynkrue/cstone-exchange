@@ -50,8 +50,7 @@ int main(int argc, char** argv)
                 checkGpuErrors(cudaGetLastError());
             }
         };
-        int numExtraLevels = argc > 1 ? std::atoi(argv[1]) : 0;
-        status = testGlobalExchange<DeviceVector>(exec, upsweep, computeParents, rank, numRanks, numExtraLevels);
+        status = testGlobalExchange<DeviceVector>(exec, upsweep, computeParents, rank, numRanks);
     }
     MPI_Finalize();
     return status;

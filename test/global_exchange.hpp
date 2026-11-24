@@ -80,8 +80,7 @@ void populate(int rep, std::span<T> leafQ)
 }
 
 template<template<class...> class Vector, class Exec, class Upsweep, class ComputeParents>
-int testGlobalExchange(Exec exec, Upsweep upsweep, ComputeParents computeParents, int rank, int numRanks,
-                       int numExtraLevels)
+int testGlobalExchange(Exec exec, Upsweep upsweep, ComputeParents computeParents, int rank, int numRanks)
 {
     using KeyType = unsigned;
     constexpr int reps = 10;
@@ -101,6 +100,10 @@ int testGlobalExchange(Exec exec, Upsweep upsweep, ComputeParents computeParents
     updateInternalTree<KeyType>(leaves, tree.data());
     auto hostTree = tree.cdata();
 
+    Box<double> box(0, 1, BoundaryType::periodic);
+    float       invThetaEff = invThetaMinMac(1.1f);
+    double      tol         = 1e-4;
+
     // global tree in the execution space, as globalOctreeAcc_ in GROMACS DomainFixed
     auto gOctreeAcc = uploadOctree<Exec>(tree);
     auto gOctree    = gOctreeAcc.cdata();
@@ -113,9 +116,39 @@ int testGlobalExchange(Exec exec, Upsweep upsweep, ComputeParents computeParents
     /// p2p setup, once
     MPI_Barrier(MPI_COMM_WORLD);
     double start      = MPI_Wtime();
-    auto   lists      = createSweepLists<KeyType>(hostTree, assignment, numExtraLevels, rank);
+    auto   lists      = createSweepLists<KeyType>(hostTree, assignment, invThetaEff, tol, box, rank);
     double setupTime  = MPI_Wtime() - start;
-    auto   siblings   = siblingNodes<KeyType>(hostTree, assignment[rank], assignment[rank + 1], numExtraLevels);
+    auto far = farNodes<KeyType>(hostTree, assignment[rank], assignment[rank + 1], invThetaEff, tol, box);
+
+    // far nodes against the nodes marked by markMacs
+    std::vector<Vec4<double>> macCenters(hostTree.numNodes);
+    for (TreeNodeIndex i = 0; i < hostTree.numNodes; ++i)
+    {
+        macCenters[i] = computeMinMacR2(hostTree.prefixes[i], invThetaEff, box);
+    }
+    std::vector<uint8_t> macs(hostTree.numNodes, 0);
+    markMacs(hostTree.prefixes, hostTree.childOffsets, hostTree.parents, macCenters.data(), box,
+             leaves.data() + firstLeaf, numLeaves, false, macs.data());
+    std::vector<TreeNodeIndex> markedFar;
+    for (TreeNodeIndex i = 1; i < hostTree.numNodes; ++i)
+    {
+        auto [nodeStart, nodeEnd] = decodePlaceholderBit2K(hostTree.prefixes[i]);
+        if (nodeStart < assignment[rank + 1] && nodeEnd > assignment[rank]) { continue; }
+        if (macs[hostTree.parents[(i - 1) / 8]] && (!macs[i] || hostTree.childOffsets[i] == 0))
+        {
+            markedFar.push_back(i);
+        }
+    }
+    long coverage[2] = {0, 0}; // missing, extra
+    for (TreeNodeIndex i : markedFar)
+    {
+        coverage[0] += !std::binary_search(far.begin(), far.end(), i);
+    }
+    for (TreeNodeIndex i : far)
+    {
+        coverage[1] += !std::binary_search(markedFar.begin(), markedFar.end(), i);
+    }
+    MPI_Allreduce(MPI_IN_PLACE, coverage, 2, MPI_LONG, MPI_SUM, MPI_COMM_WORLD);
 
     /// p2p buffers
     Vector<TreeNodeIndex> sendIdx(lists.sendIdx), recvIdx(lists.recvIdx);
@@ -170,9 +203,9 @@ int testGlobalExchange(Exec exec, Upsweep upsweep, ComputeParents computeParents
                     {recvBuf.data(), recvBuf.size()}, computeParents, tag, MPI_COMM_WORLD);
         p2pTime[rep] = MPI_Wtime() - start;
 
-        // check the sibling nodes and own leaves of this rank from the p2p sweep
+        // check the far nodes and own leaves of this rank from the p2p sweep
         auto sweptQ = download(globQ);
-        for (TreeNodeIndex n : siblings)
+        for (TreeNodeIndex n : far)
         {
             if (sweptQ[n] != reference[n]) { ++p2pErrors; }
         }
@@ -187,8 +220,8 @@ int testGlobalExchange(Exec exec, Upsweep upsweep, ComputeParents computeParents
     MPI_Allreduce(MPI_IN_PLACE, &errors, 1, MPI_INT, MPI_SUM, MPI_COMM_WORLD);
     MPI_Allreduce(MPI_IN_PLACE, &p2pErrors, 1, MPI_INT, MPI_SUM, MPI_COMM_WORLD);
     MPI_Allreduce(MPI_IN_PLACE, &setupTime, 1, MPI_DOUBLE, MPI_MAX, MPI_COMM_WORLD);
-    // max and sum over ranks of sibling nodes, send and receive messages
-    long counts3[3] = {long(siblings.size()), long(lists.send.size()), long(lists.recv.size())};
+    // max and sum over ranks of far nodes, send and receive messages
+    long counts3[3] = {long(far.size()), long(lists.send.size()), long(lists.recv.size())};
     long maxCounts[3], sumCounts[3];
     MPI_Reduce(counts3, maxCounts, 3, MPI_LONG, MPI_MAX, 0, MPI_COMM_WORLD);
     MPI_Reduce(counts3, sumCounts, 3, MPI_LONG, MPI_SUM, 0, MPI_COMM_WORLD);
@@ -214,10 +247,10 @@ int testGlobalExchange(Exec exec, Upsweep upsweep, ComputeParents computeParents
 
     if (rank == 0)
     {
-        std::printf("tree: P %d, %d leaves, %d leaves/rank, Q %zu B, %d extra levels\n", numRanks,
-                    hostTree.numLeafNodes, numLeaves, sizeof(Q), numExtraLevels);
+        std::printf("tree: P %d, %d leaves, %d leaves/rank, Q %zu B, theta 1.1, tol %g, periodic box\n", numRanks,
+                    hostTree.numLeafNodes, numLeaves, sizeof(Q), tol);
         std::printf("p2p setup [ms]: %.3f\n", setupTime * 1e3);
-        std::printf("sibling nodes, send msgs, recv msgs (max / mean): %ld / %.1f, %ld / %.1f, %ld / %.1f\n",
+        std::printf("far nodes, send msgs, recv msgs (max / mean): %ld / %.1f, %ld / %.1f, %ld / %.1f\n",
                     maxCounts[0], double(sumCounts[0]) / numRanks, maxCounts[1], double(sumCounts[1]) / numRanks,
                     maxCounts[2], double(sumCounts[2]) / numRanks);
         std::printf("rep | allgather max [ms] | mean [ms] | median [ms] | p2p max [ms] | mean [ms] | median [ms]\n");
@@ -231,6 +264,7 @@ int testGlobalExchange(Exec exec, Upsweep upsweep, ComputeParents computeParents
         }
         std::printf("allgather upsweep: %s (%d errors)\n", errors ? "FAIL" : "PASS", errors);
         std::printf("p2p sweep: %s (%d errors)\n", p2pErrors ? "FAIL" : "PASS", p2pErrors);
+        std::printf("markMacs coverage: missing %ld, extra %ld\n", coverage[0], coverage[1]);
     }
-    return errors != 0 || p2pErrors != 0;
+    return errors != 0 || p2pErrors != 0 || coverage[0] != 0;
 }
