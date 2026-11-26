@@ -80,8 +80,17 @@ void populate(int rep, std::span<T> leafQ)
     }
 }
 
-template<template<class...> class Vector, class Exec, class UpsweepFunction, class UpsweepNodes>
-int testGlobalExchange(Exec exec, UpsweepFunction upsweepFunction, UpsweepNodes upsweepNodes, int rank, int numRanks,
+/*! @brief run the sweep test
+ *
+ * @param[in] allocGlobQ     allocGlobQ(numNodes) returns the zeroed node values of this rank in the execution space
+ * @param[in] directMask     rank bits of the node peers reachable by direct stores, 0 for none
+ * @param[in] storeNodePeer  storeNodePeer(peer, nodes) writes globQ[n] of this rank into globQ[n] of peer
+ * @param[in] syncNode       returns when all node peers have finished their stores of the phase
+ */
+template<template<class...> class Vector, class Exec, class UpsweepFunction, class UpsweepNodes, class AllocQ,
+         class StoreNodePeer, class SyncNode>
+int testGlobalExchange(Exec exec, UpsweepFunction upsweepFunction, UpsweepNodes upsweepNodes, AllocQ allocGlobQ,
+                       int directMask, StoreNodePeer storeNodePeer, SyncNode syncNode, int rank, int numRanks,
                        MPI_Comm nodeComm)
 {
     using KeyType      = unsigned;
@@ -141,7 +150,8 @@ int testGlobalExchange(Exec exec, UpsweepFunction upsweepFunction, UpsweepNodes 
     double setupTime = MPI_Wtime() - start;
 
     Vector<TreeNodeIndex> sendIdx(lists.sendIdx), recvIdx(lists.recvIdx);
-    Vector<Q>             globQ(hostTree.numNodes), sendBuf(lists.sendIdx.size()), recvBuf(lists.recvIdx.size());
+    Q*                    globQ = allocGlobQ(std::size_t(hostTree.numNodes));
+    Vector<Q>             sendBuf(lists.sendIdx.size()), recvBuf(lists.recvIdx.size());
     constexpr int         tag = 0;
 
     ///! Allgather setup
@@ -157,7 +167,7 @@ int testGlobalExchange(Exec exec, UpsweepFunction upsweepFunction, UpsweepNodes 
         }
     };
 
-    std::vector<Q>      leafQ(hostTree.numLeafNodes), reference(hostTree.numNodes);
+    std::vector<Q>      leafQ(hostTree.numLeafNodes), reference(hostTree.numNodes), sweptQ(hostTree.numNodes);
     std::vector<double> allgatherTime(reps);
     std::vector<double> p2pTime(reps);
     int                 allgatherErrors = 0;
@@ -189,16 +199,24 @@ int testGlobalExchange(Exec exec, UpsweepFunction upsweepFunction, UpsweepNodes 
         ///! distributed p2p upsweep
         MPI_Barrier(MPI_COMM_WORLD);
         start = MPI_Wtime();
-        scatter(exec, gOctree.leafToInternalSpan().subspan(firstLeaf, numLeaves), localQ.data(), globQ.data());
+        scatter(exec, gOctree.leafToInternalSpan().subspan(firstLeaf, numLeaves), localQ.data(), globQ);
         globalSweep(
             exec, lists, {sendIdx.data(), sendIdx.size()}, {recvIdx.data(), recvIdx.size()},
-            std::span<Q>(globQ.data(), globQ.size()), {sendBuf.data(), sendBuf.size()},
-            {recvBuf.data(), recvBuf.size()}, [&](std::span<const TreeNodeIndex> nodes, Q* q)
-            { upsweepNodes(nodes, gOctree.childOffsets, q); }, tag, MPI_COMM_WORLD);
+            std::span<Q>(globQ, hostTree.numNodes), {sendBuf.data(), sendBuf.size()}, {recvBuf.data(), recvBuf.size()},
+            [&](std::span<const TreeNodeIndex> nodes, Q* q) { upsweepNodes(nodes, gOctree.childOffsets, q); },
+            directMask, storeNodePeer, syncNode, tag, MPI_COMM_WORLD);
         p2pTime[rep] = MPI_Wtime() - start;
 
         // check the far nodes and own leaves of this rank from the p2p sweep
-        auto sweptQ = download(globQ);
+        if constexpr (execution::HaveGpu<Exec>{})
+        {
+            memcpyD2HAsync(exec, globQ, sweptQ.size(), sweptQ.data());
+            syncGpu(exec);
+        }
+        else
+        {
+            std::copy(globQ, globQ + sweptQ.size(), sweptQ.begin());
+        }
         for (TreeNodeIndex n : far)
         {
             if (sweptQ[n] != reference[n]) { ++p2pErrors; }

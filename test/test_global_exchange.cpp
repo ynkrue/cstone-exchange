@@ -31,8 +31,16 @@ int main(int argc, char** argv)
     int      ranksPerNode = argc > 1 ? std::atoi(argv[1]) : 1;
     MPI_Comm nodeComm;
     MPI_Comm_split(MPI_COMM_WORLD, rank / ranksPerNode, rank, &nodeComm);
-    int status =
-        testGlobalExchange<std::vector>(execution::cpu, upsweepFunction, upsweepNodes, rank, numRanks, nodeComm);
+    std::vector<Q> globQ;
+    auto           allocGlobQ = [&](std::size_t numNodes)
+    {
+        globQ.assign(numNodes, Q{});
+        return globQ.data();
+    };
+    auto storeNodePeer = [](int, std::span<const TreeNodeIndex>) {};
+    auto syncNode      = [] {};
+    int  status        = testGlobalExchange<std::vector>(execution::cpu, upsweepFunction, upsweepNodes, allocGlobQ, 0,
+                                                         storeNodePeer, syncNode, rank, numRanks, nodeComm);
     MPI_Comm_free(&nodeComm);
     MPI_Finalize();
     return status;

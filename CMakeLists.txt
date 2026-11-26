@@ -28,5 +28,13 @@ foreach(target test_global_exchange test_global_exchange_gpu)
     target_link_libraries(${target} PRIVATE MPI::MPI_CXX OpenMP::OpenMP_CXX)
 endforeach()
 
+set(NVSHMEM_HOME /user-environment/env/default CACHE PATH "NVSHMEM install prefix")
+file(GLOB GTL_LIB_DIR /user-environment/linux-neoverse_v2/cray-gtl-*/lib) # not in the uenv view
+target_include_directories(test_global_exchange_gpu PRIVATE "${NVSHMEM_HOME}/include")
+target_link_directories(test_global_exchange_gpu PRIVATE "${NVSHMEM_HOME}/lib" ${GTL_LIB_DIR})
+target_link_libraries(test_global_exchange_gpu PRIVATE nvshmem_host nvshmem_device mpi_gtl_cuda)
+target_link_options(test_global_exchange_gpu PRIVATE "LINKER:-rpath=${GTL_LIB_DIR}")
+set_target_properties(test_global_exchange_gpu PROPERTIES CUDA_SEPARABLE_COMPILATION ON)
+
 target_compile_options(test_global_exchange PRIVATE -Wall -Wextra)
 target_compile_options(test_global_exchange_gpu PRIVATE -Xcompiler=-fopenmp)

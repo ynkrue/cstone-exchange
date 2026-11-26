@@ -413,29 +413,55 @@ SweepLists createSweepLists(OctreeView<const KeyType> tree, const SfcAssignment<
 
 /*! @brief exchange the needed nodes of this rank round by round and compute the parents in between
  *
+ * A phase is either entirely on the node or entirely on the network, so the first message of a phase decides for
+ * all of its messages. Messages to node peers are direct stores into globQ of the peer at the same node indices, so
+ * the receiver only syncs. Network messages are gathered and sent by MPI.
+ *
  * @param[inout] globQ           values of all global nodes, own leaves set by the caller
  * @param[in]    upsweepNodes    upsweepNodes(nodes, globQ) sets nodes from their children
+ * @param[in]    directMask      rank bits of the node peers reachable by direct stores, 0 for none
+ * @param[in]    storeNodePeer   storeNodePeer(peer, nodes) writes globQ[n] of this rank into globQ[n] of peer
+ * @param[in]    syncNode        returns when all node peers have finished their stores of the phase
  */
-template<class Exec, class Q, class UpsweepNodes>
+template<class Exec, class Q, class UpsweepNodes, class StoreNodePeer, class SyncNode>
 void globalSweep(Exec exec, const SweepLists& lists, std::span<const TreeNodeIndex> sendIdx,
                  std::span<const TreeNodeIndex> recvIdx, std::span<Q> globQ, std::span<Q> sendBuf, std::span<Q> recvBuf,
-                 UpsweepNodes&& upsweepNodes, int tag, MPI_Comm comm)
+                 UpsweepNodes&& upsweepNodes, int directMask, StoreNodePeer&& storeNodePeer, SyncNode&& syncNode,
+                 int tag, MPI_Comm comm)
 {
     int numRounds = int(lists.sendOffsets.size()) - 1;
+    int myRank;
+    MPI_Comm_rank(comm, &myRank);
+    auto isDirect = [&](int peer) { return ((peer ^ myRank) & ~directMask) == 0; };
 
-    // post all receives first, one request per message
+    // post all receives first, one request per message, none for direct messages
     std::vector<MPI_Request> recvRequests, sendRequests;
     for (std::size_t m = 0; m < lists.recvPeers.size(); ++m)
     {
-        mpiRecvAsync(recvBuf.data() + lists.recvDispl[m], lists.recvDispl[m + 1] - lists.recvDispl[m],
-                     lists.recvPeers[m], tag, recvRequests, comm);
+        if (isDirect(lists.recvPeers[m])) { recvRequests.push_back(MPI_REQUEST_NULL); }
+        else
+        {
+            mpiRecvAsync(recvBuf.data() + lists.recvDispl[m], lists.recvDispl[m + 1] - lists.recvDispl[m],
+                         lists.recvPeers[m], tag, recvRequests, comm);
+        }
     }
+
+    // the own leaves are set, node peers may start storing
+    if (directMask != 0) { syncNode(); }
 
     for (int round = 0; round < numRounds; ++round)
     {
         // the messages of a round are contiguous, so one gather and one scatter per round
         TreeNodeIndex sendFirst = lists.sendOffsets[round], sendLast = lists.sendOffsets[round + 1];
-        if (sendFirst != sendLast)
+        if (sendFirst != sendLast && isDirect(lists.sendPeers[sendFirst]))
+        {
+            for (TreeNodeIndex m = sendFirst; m < sendLast; ++m)
+            {
+                storeNodePeer(lists.sendPeers[m],
+                              sendIdx.subspan(lists.sendDispl[m], lists.sendDispl[m + 1] - lists.sendDispl[m]));
+            }
+        }
+        else if (sendFirst != sendLast)
         {
             TreeNodeIndex first = lists.sendDispl[sendFirst];
             TreeNodeIndex count = lists.sendDispl[sendLast] - first;
@@ -449,13 +475,16 @@ void globalSweep(Exec exec, const SweepLists& lists, std::span<const TreeNodeInd
         }
 
         TreeNodeIndex recvFirst = lists.recvOffsets[round], recvLast = lists.recvOffsets[round + 1];
-        if (recvFirst != recvLast)
+        if (recvFirst != recvLast && !isDirect(lists.recvPeers[recvFirst]))
         {
             TreeNodeIndex first = lists.recvDispl[recvFirst];
             TreeNodeIndex count = lists.recvDispl[recvLast] - first;
             MPI_Waitall(recvLast - recvFirst, recvRequests.data() + recvFirst, MPI_STATUSES_IGNORE);
             scatter(exec, recvIdx.subspan(first, count), recvBuf.data() + first, globQ.data());
         }
+
+        // all node peers have stored this phase and read the earlier values
+        if (directMask != 0) { syncNode(); }
 
         std::span nodes(lists.computeIdx.data() + lists.computeOffsets[round],
                         lists.computeIdx.data() + lists.computeOffsets[round + 1]);
