@@ -36,6 +36,43 @@ __global__ void storeNodePeerKernel(const TreeNodeIndex* nodes, Q* peerQ, const 
     reinterpret_cast<double*>(peerQ + n)[threadIdx.x] = reinterpret_cast<const double*>(globQ + n)[threadIdx.x];
 }
 
+//! @brief node nodes[i] of every peerQ[m] = values[i]
+__global__ void scatterNodePeersKernel(const TreeNodeIndex* nodes, const Q* values, Q* const* peerQ, int numPeers)
+{
+    double v = reinterpret_cast<const double*>(values + blockIdx.x)[threadIdx.x];
+    for (int m = 0; m < numPeers; ++m)
+    {
+        reinterpret_cast<double*>(peerQ[m] + nodes[blockIdx.x])[threadIdx.x] = v;
+    }
+}
+
+// nodes of one parent launch, passed by value
+constexpr int maxListNodes = 256;
+struct NodeList
+{
+    int           count;
+    TreeNodeIndex nodes[maxListNodes];
+};
+
+//! @brief one block computes the parents of the list in order, thread c sums component c of the children
+__global__ void sumParentsList(NodeList list, const TreeNodeIndex* children, Q* q)
+{
+    for (int i = 0; i < list.count; ++i)
+    {
+        TreeNodeIndex n = list.nodes[i];
+        if (children[n])
+        {
+            double* qd  = reinterpret_cast<double*>(q);
+            double  sum = qd[std::size_t(children[n]) * numComponents + threadIdx.x];
+            for (int k = 1; k < 8; ++k)
+            {
+                sum += qd[std::size_t(children[n] + k) * numComponents + threadIdx.x];
+            }
+            qd[std::size_t(n) * numComponents + threadIdx.x] = sum;
+        }
+    }
+}
+
 /*! @brief thread m signals node peer m that count syncs are done and waits until node peer m has done as many
  *
  * One signal slot per node peer, so that the next signal of a fast peer cannot stand in for a slow peer. The system
@@ -78,6 +115,7 @@ int main(int argc, char** argv)
     uint64_t* nodeSignal = static_cast<uint64_t*>(nvshmem_calloc(numNodePeers, sizeof(uint64_t)));
     uint64_t  numSyncs   = 0;
     Q*        globQ      = nullptr;
+    Q**       nodePeerQ  = nullptr; // device array of the globQ pointers of the node peers
     int       status;
     {
         StreamHolder      stream;
@@ -97,23 +135,36 @@ int main(int argc, char** argv)
         };
         auto upsweepNodes = [&](std::span<const TreeNodeIndex> nodes, const TreeNodeIndex* children, Q* q)
         {
-            for (TreeNodeIndex n : nodes)
+            for (std::size_t first = 0; first < nodes.size(); first += maxListNodes)
             {
-                sumParents<<<1, 1, 0, exec>>>(n, n + 1, children, q);
+                NodeList list;
+                list.count = int(std::min<std::size_t>(maxListNodes, nodes.size() - first));
+                std::copy_n(nodes.begin() + first, list.count, list.nodes);
+                sumParentsList<<<1, numComponents, 0, exec>>>(list, children, q);
                 checkGpuErrors(cudaGetLastError());
             }
         };
-        // globQ of the node peers, indexed by rank
+        // globQ of the node peers, indexed by rank, and the device copy in the order of nodePeers
         std::vector<Q*> peerQ(numRanks, nullptr);
         auto            allocGlobQ = [&](std::size_t numNodes)
         {
             globQ = static_cast<Q*>(nvshmem_calloc(numNodes, sizeof(Q)));
+            std::vector<Q*> orderedQ;
             for (int p : nodePeers)
             {
                 peerQ[p] = static_cast<Q*>(nvshmem_ptr(globQ, p));
                 if (!peerQ[p]) { MPI_Abort(MPI_COMM_WORLD, 1); }
+                orderedQ.push_back(peerQ[p]);
             }
+            checkGpuErrors(cudaMalloc(&nodePeerQ, numNodePeers * sizeof(Q*)));
+            checkGpuErrors(cudaMemcpy(nodePeerQ, orderedQ.data(), numNodePeers * sizeof(Q*), cudaMemcpyHostToDevice));
             return globQ;
+        };
+        auto scatterNodePeers = [&](std::span<const TreeNodeIndex> nodes, const Q* values)
+        {
+            scatterNodePeersKernel<<<nodes.size(), numComponents, 0, exec>>>(nodes.data(), values, nodePeerQ,
+                                                                             numNodePeers);
+            checkGpuErrors(cudaGetLastError());
         };
         auto storeNodePeer = [&](int peer, std::span<const TreeNodeIndex> nodes)
         {
@@ -125,10 +176,12 @@ int main(int argc, char** argv)
             syncNodeKernel<<<1, numNodePeers, 0, exec>>>(nodeSignal, nodePeerPes.data(), myPos, ++numSyncs);
             checkGpuErrors(cudaGetLastError());
         };
-        status =
-            testGlobalExchange<DeviceVector>(exec, upsweepFunction, upsweepNodes, allocGlobQ, nodeMask(rank, nodeComm),
-                                             storeNodePeer, syncNode, rank, numRanks, nodeComm);
+        int maxPartners = argc > 1 ? std::atoi(argv[1]) : 8;
+        status = testGlobalExchange<DeviceVector>(exec, upsweepFunction, upsweepNodes, allocGlobQ,
+                                                  nodeMask(rank, nodeComm), storeNodePeer, scatterNodePeers, syncNode,
+                                                  rank, numRanks, nodeComm, maxPartners);
     }
+    checkGpuErrors(cudaFree(nodePeerQ));
     nvshmem_free(globQ);
     nvshmem_free(nodeSignal);
     MPI_Comm_free(&nodeComm);

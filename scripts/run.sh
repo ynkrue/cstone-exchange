@@ -15,7 +15,8 @@ export MPICH_GPU_IPC_THRESHOLD=1
 export MPIR_CVAR_ENABLE_NODE_COMM=1
 
 BIN=${1:-build/test_global_exchange_gpu}
+shift
 
 for ((n = 4; n <= SLURM_JOB_NUM_NODES; n *= 2)); do
-    srun -N$n --ntasks-per-node=4 --gpus-per-task=1 --cpus-per-task=72 -t2 $BIN
+    srun -N$n --ntasks-per-node=4 --gpus-per-task=1 --cpus-per-task=72 -t2 $BIN "$@"
 done

@@ -85,13 +85,16 @@ void populate(int rep, std::span<T> leafQ)
  * @param[in] allocGlobQ     allocGlobQ(numNodes) returns the zeroed node values of this rank in the execution space
  * @param[in] directMask     rank bits of the node peers reachable by direct stores, 0 for none
  * @param[in] storeNodePeer  storeNodePeer(peer, nodes) writes globQ[n] of this rank into globQ[n] of peer
+ * @param[in] scatterNodePeers  scatterNodePeers(nodes, values) writes values[i] into globQ[nodes[i]] of all node peers
  * @param[in] syncNode       returns when all node peers have finished their stores of the phase
+ * @param[in] maxPartners    most partners per rank and round, per unit rank
  */
 template<template<class...> class Vector, class Exec, class UpsweepFunction, class UpsweepNodes, class AllocQ,
-         class StoreNodePeer, class SyncNode>
+         class StoreNodePeer, class ScatterNodePeers, class SyncNode>
 int testGlobalExchange(Exec exec, UpsweepFunction upsweepFunction, UpsweepNodes upsweepNodes, AllocQ allocGlobQ,
-                       int directMask, StoreNodePeer storeNodePeer, SyncNode syncNode, int rank, int numRanks,
-                       MPI_Comm nodeComm, int extraLevels = 0)
+                       int directMask, StoreNodePeer storeNodePeer, ScatterNodePeers scatterNodePeers,
+                       SyncNode syncNode, int rank, int numRanks, MPI_Comm nodeComm, int maxPartners,
+                       int extraLevels = 0)
 {
     using KeyType      = unsigned;
     constexpr int reps = 10;
@@ -161,8 +164,9 @@ int testGlobalExchange(Exec exec, UpsweepFunction upsweepFunction, UpsweepNodes 
     MPI_Barrier(MPI_COMM_WORLD);
     double start    = MPI_Wtime();
     int    unitMask = nodeMask(rank, nodeComm);
-    auto   masks = unitMask ? roundMasks(numRanks, unitMask) : levelMasks(numRanks, hostTree.numLeafNodes / numRanks);
-    auto   lists = createSweepLists<KeyType>(hostTree, assignment, masks, invThetaEff, tol, box, rank);
+    auto   masks =
+        unitMask ? roundMasks(numRanks, unitMask, maxPartners) : levelMasks(numRanks, hostTree.numLeafNodes / numRanks);
+    auto   lists     = createSweepLists<KeyType>(hostTree, assignment, masks, invThetaEff, tol, box, rank);
     double setupTime = MPI_Wtime() - start;
 
     Vector<TreeNodeIndex> sendIdx(lists.sendIdx), recvIdx(lists.recvIdx);
@@ -220,7 +224,7 @@ int testGlobalExchange(Exec exec, UpsweepFunction upsweepFunction, UpsweepNodes 
             exec, lists, {sendIdx.data(), sendIdx.size()}, {recvIdx.data(), recvIdx.size()},
             std::span<Q>(globQ, hostTree.numNodes), {sendBuf.data(), sendBuf.size()}, {recvBuf.data(), recvBuf.size()},
             [&](std::span<const TreeNodeIndex> nodes, Q* q) { upsweepNodes(nodes, gOctree.childOffsets, q); },
-            directMask, storeNodePeer, syncNode, tag, MPI_COMM_WORLD);
+            directMask, storeNodePeer, scatterNodePeers, syncNode, tag, MPI_COMM_WORLD);
         p2pTime[rep] = MPI_Wtime() - start;
 
         // check the far nodes and own leaves of this rank from the p2p sweep
@@ -295,6 +299,7 @@ int testGlobalExchange(Exec exec, UpsweepFunction upsweepFunction, UpsweepNodes 
             std::printf(t ? " %x" : "%x", masks[t]);
         }
         std::printf("\n");
+        std::printf("max partners per rank and round: %d\n", maxPartners);
         std::printf("p2p setup [ms]: %.3f\n", setupTime * 1e3);
         std::printf("far nodes, send msgs, recv msgs (max / mean): %ld / %.1f, %ld / %.1f, %ld / %.1f\n", maxCounts[0],
                     double(sumCounts[0]) / numRanks, maxCounts[1], double(sumCounts[1]) / numRanks, maxCounts[2],
