@@ -82,7 +82,7 @@ void populate(int rep, std::span<T> leafQ)
 
 template<template<class...> class Vector, class Exec, class UpsweepFunction, class UpsweepNodes>
 int testGlobalExchange(Exec exec, UpsweepFunction upsweepFunction, UpsweepNodes upsweepNodes, int rank, int numRanks,
-                       int ranksPerUnit)
+                       MPI_Comm nodeComm)
 {
     using KeyType      = unsigned;
     constexpr int reps = 10;
@@ -134,10 +134,10 @@ int testGlobalExchange(Exec exec, UpsweepFunction upsweepFunction, UpsweepNodes 
 
     ///! Relay setup
     MPI_Barrier(MPI_COMM_WORLD);
-    double start     = MPI_Wtime();
-    auto   masks     = ranksPerUnit == 1 ? levelMasks(numRanks, hostTree.numLeafNodes / numRanks)
-                                         : roundMasks(numRanks, ranksPerUnit - 1);
-    auto   lists     = createSweepLists<KeyType>(hostTree, assignment, masks, invThetaEff, tol, box, rank);
+    double start    = MPI_Wtime();
+    int    unitMask = nodeMask(rank, nodeComm);
+    auto   masks = unitMask ? roundMasks(numRanks, unitMask) : levelMasks(numRanks, hostTree.numLeafNodes / numRanks);
+    auto   lists = createSweepLists<KeyType>(hostTree, assignment, masks, invThetaEff, tol, box, rank);
     double setupTime = MPI_Wtime() - start;
 
     Vector<TreeNodeIndex> sendIdx(lists.sendIdx), recvIdx(lists.recvIdx);
@@ -219,6 +219,18 @@ int testGlobalExchange(Exec exec, UpsweepFunction upsweepFunction, UpsweepNodes 
     long maxCounts[3], sumCounts[3];
     MPI_Reduce(rankCounts, maxCounts, 3, MPI_LONG, MPI_MAX, 0, MPI_COMM_WORLD);
     MPI_Reduce(rankCounts, sumCounts, 3, MPI_LONG, MPI_SUM, 0, MPI_COMM_WORLD);
+    // messages to peers outside the node and their node counts
+    long netCounts[2] = {0, 0}, maxNet[2], sumNet[2];
+    for (std::size_t m = 0; m < lists.sendPeers.size(); ++m)
+    {
+        if ((lists.sendPeers[m] ^ rank) & ~unitMask)
+        {
+            ++netCounts[0];
+            netCounts[1] += lists.sendDispl[m + 1] - lists.sendDispl[m];
+        }
+    }
+    MPI_Reduce(netCounts, maxNet, 2, MPI_LONG, MPI_MAX, 0, MPI_COMM_WORLD);
+    MPI_Reduce(netCounts, sumNet, 2, MPI_LONG, MPI_SUM, 0, MPI_COMM_WORLD);
     std::vector<double> gatheredTimes(std::size_t(numRanks) * reps), gatheredP2pTimes(std::size_t(numRanks) * reps);
     MPI_Allgather(allgatherTime.data(), reps, MPI_DOUBLE, gatheredTimes.data(), reps, MPI_DOUBLE, MPI_COMM_WORLD);
     MPI_Allgather(p2pTime.data(), reps, MPI_DOUBLE, gatheredP2pTimes.data(), reps, MPI_DOUBLE, MPI_COMM_WORLD);
@@ -253,6 +265,8 @@ int testGlobalExchange(Exec exec, UpsweepFunction upsweepFunction, UpsweepNodes 
         std::printf("far nodes, send msgs, recv msgs (max / mean): %ld / %.1f, %ld / %.1f, %ld / %.1f\n", maxCounts[0],
                     double(sumCounts[0]) / numRanks, maxCounts[1], double(sumCounts[1]) / numRanks, maxCounts[2],
                     double(sumCounts[2]) / numRanks);
+        std::printf("network send msgs, values (max / mean): %ld / %.1f, %ld / %.1f\n", maxNet[0],
+                    double(sumNet[0]) / numRanks, maxNet[1], double(sumNet[1]) / numRanks);
         std::printf("rep | allgather max [ms] | mean [ms] | median [ms] | p2p max [ms] | mean [ms] | median [ms]\n");
         for (int rep = 0; rep < reps; ++rep)
         {

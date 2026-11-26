@@ -20,6 +20,7 @@
 #include <cassert>
 #include <cmath>
 #include <span>
+#include <stdexcept>
 #include <vector>
 #include <mpi.h>
 
@@ -250,7 +251,10 @@ std::vector<TreeNodeIndex> messageNodes(OctreeView<const KeyType> tree, const Sf
 
     for (TreeNodeIndex i : cover)
     {
-        if (covered(tree.prefixes[i], tree.childOffsets[i] == 0, receivers, invThetaEff, tol, box)) { nodes.push_back(i); }
+        if (covered(tree.prefixes[i], tree.childOffsets[i] == 0, receivers, invThetaEff, tol, box))
+        {
+            nodes.push_back(i);
+        }
     }
 
     std::sort(nodes.begin(), nodes.end());
@@ -269,7 +273,35 @@ struct SweepLists
     std::vector<TreeNodeIndex> computeIdx;               // parents computed at the end of each round
 };
 
+/*! @brief rank bits that differ within the node of rank, from the ranks of nodeComm in the SFC communicator
+ *
+ * Throws if the ranks of the node are not the 1 << popcount(mask) ranks that agree with rank outside the mask.
+ */
+inline int nodeMask(int rank, MPI_Comm nodeComm)
+{
+    int size;
+    MPI_Comm_size(nodeComm, &size);
+    std::vector<int> ranks(size);
+    MPI_Allgather(&rank, 1, MPI_INT, ranks.data(), 1, MPI_INT, nodeComm);
+
+    int mask = 0;
+    for (int r : ranks)
+    {
+        mask |= r ^ rank;
+    }
+    std::sort(ranks.begin(), ranks.end());
+    bool ok =
+        size == (1 << std::popcount(unsigned(mask))) && std::adjacent_find(ranks.begin(), ranks.end()) == ranks.end();
+    ok = ok && std::all_of(ranks.begin(), ranks.end(), [&](int r) { return (r & ~mask) == (rank & ~mask); });
+    if (!ok) { throw std::runtime_error("ranks of the node are not a subset block of the SFC ranks"); }
+    return mask;
+}
+
 /*! @brief sweep lists of myRank for the cumulative rank bit masks of the rounds, requires P a power of two
+ *
+ * Each network round has two phases when a node has several ranks. In the first the handler ranks send and receive
+ * the bundles of the node pairs, in the second the received nodes are pooled to the other node peers and the round
+ * computes.
  *
  * @param[in] masks  rank bits known after each round, the last one is P - 1, the first one the unit of ranks
  */
@@ -282,41 +314,95 @@ SweepLists createSweepLists(OctreeView<const KeyType> tree, const SfcAssignment<
     SweepLists lists;
     lists.sendOffsets = lists.recvOffsets = lists.computeOffsets = lists.sendDispl = lists.recvDispl = {0};
 
+    // the ranks of the node of myRank in ascending order
+    unsigned         unitMask = masks[0];
+    std::vector<int> nodePeers;
+    unsigned         unitSub = 0;
+    do
+    {
+        nodePeers.push_back((myRank & ~unitMask) | int(unitSub));
+        unitSub = (unitSub - unitMask) & unitMask;
+    } while (unitSub != 0);
+    int numNodePeers = int(nodePeers.size());
+
+    auto addSend = [&](int peer, const std::vector<TreeNodeIndex>& nodes)
+    {
+        if (nodes.empty()) { return; }
+        lists.sendPeers.push_back(peer);
+        lists.sendIdx.insert(lists.sendIdx.end(), nodes.begin(), nodes.end());
+        lists.sendDispl.push_back(lists.sendIdx.size());
+    };
+    auto addRecv = [&](int peer, const std::vector<TreeNodeIndex>& nodes)
+    {
+        if (nodes.empty()) { return; }
+        lists.recvPeers.push_back(peer);
+        lists.recvIdx.insert(lists.recvIdx.end(), nodes.begin(), nodes.end());
+        lists.recvDispl.push_back(lists.recvIdx.size());
+    };
+    auto endPhase = [&]()
+    {
+        lists.sendOffsets.push_back(lists.sendPeers.size());
+        lists.recvOffsets.push_back(lists.recvPeers.size());
+    };
+
     for (int t = 0; t < int(masks.size()); ++t)
     {
         // partners differ from myRank only in the new bits of this round
         int prevMask = t ? masks[t - 1] : 0;
         int fresh    = masks[t] & ~prevMask;
         int recvMask = masks[t] & ~masks[0];
-        int base     = myRank & ~fresh;
 
         auto myReceivers = receiverBoxes(assignment, myRank, recvMask);
 
-        unsigned sub = 0;
-        do
+        // calls f(j) for the partner offsets j of the handler, the node bundle j goes to node peer k % numNodePeers
+        auto forHandled = [&](int handler, auto&& f)
         {
-            int peer = base | int(sub);
-            sub      = (sub - fresh) & fresh;
-            if (peer == myRank) { continue; }
+            unsigned k = 0;
+            for (unsigned j = fresh & -fresh; j != 0; j = (j - fresh) & fresh)
+            {
+                if (t == 0 || nodePeers[k % numNodePeers] == handler) { f(int(j)); }
+                ++k;
+            }
+        };
 
-            auto peerReceivers = receiverBoxes(assignment, peer, recvMask);
-            auto sendNodes = messageNodes(tree, assignment, myRank, prevMask, peerReceivers, invThetaEff, tol, box);
-            auto recvNodes = messageNodes(tree, assignment, peer, prevMask, myReceivers, invThetaEff, tol, box);
-            if (!sendNodes.empty())
+        std::vector<TreeNodeIndex> received;
+        forHandled(
+            myRank,
+            [&](int j)
             {
-                lists.sendPeers.push_back(peer);
-                lists.sendIdx.insert(lists.sendIdx.end(), sendNodes.begin(), sendNodes.end());
-                lists.sendDispl.push_back(lists.sendIdx.size());
-            }
-            if (!recvNodes.empty())
+                int  peer          = myRank ^ j;
+                auto peerReceivers = receiverBoxes(assignment, peer, recvMask);
+                addSend(peer, messageNodes(tree, assignment, myRank, prevMask, peerReceivers, invThetaEff, tol, box));
+                auto recvNodes = messageNodes(tree, assignment, peer, prevMask, myReceivers, invThetaEff, tol, box);
+                addRecv(peer, recvNodes);
+                received.insert(received.end(), recvNodes.begin(), recvNodes.end());
+            });
+        endPhase();
+
+        // the handlers pool the bundles of the node pairs to the other node peers, no compute in the first phase
+        if (t > 0 && numNodePeers > 1)
+        {
+            lists.computeOffsets.push_back(lists.computeIdx.size());
+            std::sort(received.begin(), received.end());
+            received.erase(std::unique(received.begin(), received.end()), received.end());
+            for (int nodePeer : nodePeers)
             {
-                lists.recvPeers.push_back(peer);
-                lists.recvIdx.insert(lists.recvIdx.end(), recvNodes.begin(), recvNodes.end());
-                lists.recvDispl.push_back(lists.recvIdx.size());
+                if (nodePeer == myRank) { continue; }
+                std::vector<TreeNodeIndex> pooled;
+                forHandled(nodePeer,
+                           [&](int j)
+                           {
+                               auto nodes = messageNodes(tree, assignment, nodePeer ^ j, prevMask, myReceivers,
+                                                         invThetaEff, tol, box);
+                               pooled.insert(pooled.end(), nodes.begin(), nodes.end());
+                           });
+                std::sort(pooled.begin(), pooled.end());
+                pooled.erase(std::unique(pooled.begin(), pooled.end()), pooled.end());
+                addSend(nodePeer, received);
+                addRecv(nodePeer, pooled);
             }
-        } while (sub != 0);
-        lists.sendOffsets.push_back(lists.sendPeers.size());
-        lists.recvOffsets.push_back(lists.recvPeers.size());
+            endPhase();
+        }
 
         auto parents = computeNodes(tree, assignment, masks, t, myRank, myReceivers, invThetaEff, tol, box);
         lists.computeIdx.insert(lists.computeIdx.end(), parents.begin(), parents.end());

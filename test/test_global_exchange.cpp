@@ -28,9 +28,12 @@ int main(int argc, char** argv)
             q[n] = CombineSum{}(n, children[n], q);
         }
     };
-    int ranksPerUnit = argc > 1 ? std::atoi(argv[1]) : 1;
+    int      ranksPerNode = argc > 1 ? std::atoi(argv[1]) : 1;
+    MPI_Comm nodeComm;
+    MPI_Comm_split(MPI_COMM_WORLD, rank / ranksPerNode, rank, &nodeComm);
     int status =
-        testGlobalExchange<std::vector>(execution::cpu, upsweepFunction, upsweepNodes, rank, numRanks, ranksPerUnit);
+        testGlobalExchange<std::vector>(execution::cpu, upsweepFunction, upsweepNodes, rank, numRanks, nodeComm);
+    MPI_Comm_free(&nodeComm);
     MPI_Finalize();
     return status;
 }
