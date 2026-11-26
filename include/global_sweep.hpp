@@ -45,17 +45,38 @@ bool macFails(KeyType prefix, const IBox& target, float invThetaEff, T macScale,
     return evaluateMacPbc(makeVec3(c), c[3] * macScale, tc, ts, box);
 }
 
-/*! @brief boxes of the ranks that get the data of rank after the round with low low bits, rank included */
+/*! @brief boxes of the ranks that agree with rank in the bits of mask, rank included
+ *
+ * These are the ranks that get the data of rank after the round, with the unit bits removed from the round mask.
+ */
 template<class KeyType>
-std::vector<IBox> receiverBoxes(const SfcAssignment<KeyType>& assignment, int rank, int low)
+std::vector<IBox> receiverBoxes(const SfcAssignment<KeyType>& assignment, int rank, int mask)
 {
+    unsigned          free = (assignment.numRanks() - 1) & ~mask;
     std::vector<IBox> boxes;
-    for (int k = 0; k < (assignment.numRanks() >> low); ++k)
+    unsigned          sub = 0;
+    do
     {
-        int r = (rank & ((1 << low) - 1)) | (k << low);
+        int r = (rank & mask) | sub;
         boxes.push_back(assignmentIBox(assignment[r], assignment[r + 1]));
-    }
+        sub = (sub - free) & free;
+    } while (sub != 0);
     return boxes;
+}
+
+/*! @brief how many ranks owning leaves of node prefix agree with rank outside the bits of mask
+ *
+ * Returns 0 for none, 1 for some and 2 for all. The ranks of a node of at least one rank form an aligned
+ * power of two block, which holds for equal SFC segments and a power of two number of ranks.
+ */
+template<class KeyType>
+int knownRanks(const SfcAssignment<KeyType>& assignment, KeyType prefix, int rank, int mask)
+{
+    auto [start, end] = decodePlaceholderBit2K(prefix);
+    int lo            = assignment.findRank(start);
+    int block         = assignment.findRank(end - 1) - lo;
+    if ((lo ^ rank) & ~mask & ~block) { return 0; }
+    return (block & ~mask) ? 1 : 2;
 }
 
 /*! @brief true if some target needs node prefix
@@ -80,55 +101,136 @@ bool needs(KeyType prefix, bool isLeaf, std::span<const IBox> targets, float inv
     return false;
 }
 
-/*! @brief number of rank bits exchanged after the given round
+/*! @brief cumulative rank bits known after each round of the level schedule, 3 bits per tree level
  *
- * 3 bits per round (radix 8) is the time optimum of the rank relay in the LogGP model and coincides with one tree
- * level per round (see .claude/docs/model.md Proposition 2).
+ * The first mask is 0, so round 0 is the local upsweep. 3 bits per round (radix 8) is the time optimum of the rank
+ * relay in the LogGP model and coincides with one tree level per round (see .claude/docs/model.md Proposition 2).
+ * Requires numRanks * leavesPerRank to be a power of 8.
  */
-inline int lowBits(int leavesPerRank, int round) { return 3 * round - std::countr_zero(unsigned(leavesPerRank)); }
-
-/*! @brief true if rank computes its node of the given round
- *
- * That is its level L - round ancestor, needed by a rank behind it or implied by a needed ancestor.
- * The receivers are the boxes of the ranks behind rank in this round (receiverBoxes).
- */
-template<class KeyType, class T>
-bool computesParent(OctreeView<const KeyType> tree, const SfcAssignment<KeyType>& assignment, int rank, int round,
-                    std::span<const IBox> receivers, float invThetaEff, T tol, const Box<T>& box)
+inline std::vector<int> levelMasks(int numRanks, int leavesPerRank)
 {
-    int numLevels = maxDepth(tree.levelRange, maxTreeLevel<KeyType>{} + 2);
-
-    for (int level = numLevels - round; level >= 1; --level)
+    int              rankBits = std::countr_zero(unsigned(numRanks));
+    std::vector<int> masks{0};
+    for (int bits = 3 - std::countr_zero(unsigned(leavesPerRank)); bits <= rankBits; bits += 3)
     {
-        KeyType a = encodePlaceholderBit(assignment[rank], 3 * level);
-        if (needs(a, false, receivers, invThetaEff, tol, box)) { return true; }
+        masks.push_back((1 << bits) - 1);
+    }
+    return masks;
+}
+
+/*! @brief cumulative rank bits known after each round for units of ranks that exchange first
+ *
+ * The first mask is unitMask. The other rank bits follow lowest first in as few rounds as the radix allows, with
+ * group sizes as equal as possible, larger groups first. A rank talks to 8 partners per round and unit rank at
+ * most (see .claude/docs/model.md Proposition 3).
+ */
+inline std::vector<int> roundMasks(int numRanks, int unitMask)
+{
+    int maxBits = std::bit_width(unsigned(8 * (1 << std::popcount(unsigned(unitMask))) + 1)) - 1;
+    int rest    = (numRanks - 1) & ~unitMask;
+    int q       = std::popcount(unsigned(rest));
+    int R       = (q + maxBits - 1) / maxBits;
+
+    std::vector<int> masks{unitMask};
+    for (int g = 0; g < R; ++g)
+    {
+        int mask = masks.back();
+        for (int b = 0; b < q / R + (g < q % R ? 1 : 0); ++b)
+        {
+            mask |= rest & -rest;
+            rest &= rest - 1;
+        }
+        masks.push_back(mask);
+    }
+    return masks;
+}
+
+/*! @brief true if the node or one of its ancestors is needed by some receiver */
+template<class KeyType, class T>
+bool covered(KeyType prefix, bool isLeaf, std::span<const IBox> receivers, float invThetaEff, T tol, const Box<T>& box)
+{
+    if (needs(prefix, isLeaf, receivers, invThetaEff, tol, box)) { return true; }
+
+    KeyType nodeStart = decodePlaceholderBit(prefix);
+    for (int level = decodePrefixLength(prefix) / 3 - 1; level >= 1; --level)
+    {
+        KeyType ancestor = encodePlaceholderBit(enclosingBoxCode(nodeStart, level), 3 * level);
+        if (needs(ancestor, false, receivers, invThetaEff, tol, box)) { return true; }
     }
     return false;
 }
 
-/*! @brief nodes src sends to dst in the given round, sorted and unique
+//! @brief maximal tree nodes known to rank when it agrees with the ranks of the nodes outside the bits of mask
+template<class KeyType>
+std::vector<TreeNodeIndex> coverNodes(OctreeView<const KeyType> tree, const SfcAssignment<KeyType>& assignment,
+                                      int rank, int mask)
+{
+    std::vector<TreeNodeIndex> cover, stack{0};
+    while (!stack.empty())
+    {
+        TreeNodeIndex i = stack.back();
+        stack.pop_back();
+        int known = knownRanks(assignment, tree.prefixes[i], rank, mask);
+        if (known == 2) { cover.push_back(i); }
+        else if (known == 1)
+        {
+            for (int c = 0; c < 8; ++c)
+            {
+                stack.push_back(tree.childOffsets[i] + c);
+            }
+        }
+    }
+    return cover;
+}
+
+/*! @brief internal nodes rank computes at the end of round t, deepest first
  *
- * The nodes of the cover of src needed by the receivers, which are the boxes of the ranks behind dst,
- * plus the cover if dst computes the common parent.
+ * The nodes of the cover of rank with masks[t] that no single partner knows before the round and that are needed
+ * by the receivers of rank or implied by a needed ancestor. Round 0 computes all internal nodes of the cover.
+ */
+template<class KeyType, class T>
+std::vector<TreeNodeIndex> computeNodes(OctreeView<const KeyType> tree, const SfcAssignment<KeyType>& assignment,
+                                        std::span<const int> masks, int t, int rank, std::span<const IBox> receivers,
+                                        float invThetaEff, T tol, const Box<T>& box)
+{
+    int prevMask = t ? masks[t - 1] : 0;
+
+    std::vector<TreeNodeIndex> nodes, stack = coverNodes(tree, assignment, rank, masks[t]);
+    while (!stack.empty())
+    {
+        TreeNodeIndex i = stack.back();
+        stack.pop_back();
+        KeyType prefix = tree.prefixes[i];
+        if (tree.childOffsets[i] == 0) { continue; }
+        int first = assignment.findRank(decodePlaceholderBit(prefix));
+        if (t > 0 && knownRanks(assignment, prefix, first, prevMask) == 2) { continue; }
+
+        // the root has no parent for the MAC test and nobody needs it
+        if (i != 0 && covered(prefix, false, receivers, invThetaEff, tol, box)) { nodes.push_back(i); }
+        for (int c = 0; c < 8; ++c)
+        {
+            stack.push_back(tree.childOffsets[i] + c);
+        }
+    }
+
+    // tree nodes are ordered by level, so descending indices are deepest first
+    std::sort(nodes.rbegin(), nodes.rend());
+    return nodes;
+}
+
+/*! @brief nodes src sends to dst in a round, sorted and unique
+ *
+ * The nodes of the cover of src with prevMask that the receivers of dst need or that are implied by a needed
+ * ancestor, plus the descendants of the cover that the receivers need.
  */
 template<class KeyType, class T>
 std::vector<TreeNodeIndex> messageNodes(OctreeView<const KeyType> tree, const SfcAssignment<KeyType>& assignment,
-                                        int src, int round, std::span<const IBox> receivers, bool dstComputesParent,
-                                        float invThetaEff, T tol, const Box<T>& box)
+                                        int src, int prevMask, std::span<const IBox> receivers, float invThetaEff,
+                                        T tol, const Box<T>& box)
 {
-    int numLevels = maxDepth(tree.levelRange, maxTreeLevel<KeyType>{} + 2);
-    int level     = numLevels - round + 1;
+    auto cover = coverNodes(tree, assignment, src, prevMask);
 
-    // cover of src in this round, the nodes it knows
-    KeyType                    coverStart = enclosingBoxCode(assignment[src], level);
-    KeyType                    coverEnd   = std::max(assignment[src + 1], coverStart + nodeRange<KeyType>(level));
-    std::vector<TreeNodeIndex> cover;
-    for (KeyType key = coverStart; key < coverEnd; key += nodeRange<KeyType>(level))
-    {
-        cover.push_back(locateNode(encodePlaceholderBit(key, 3 * level), tree.prefixes, tree.levelRange));
-    }
-
-    // descend while the node fails for some rank behind dst
+    // descend while the node fails for some receiver
     std::vector<TreeNodeIndex> nodes, stack = cover;
     while (!stack.empty())
     {
@@ -146,7 +248,10 @@ std::vector<TreeNodeIndex> messageNodes(OctreeView<const KeyType> tree, const Sf
         }
     }
 
-    if (dstComputesParent) { nodes.insert(nodes.end(), cover.begin(), cover.end()); }
+    for (TreeNodeIndex i : cover)
+    {
+        if (covered(tree.prefixes[i], tree.childOffsets[i] == 0, receivers, invThetaEff, tol, box)) { nodes.push_back(i); }
+    }
 
     std::sort(nodes.begin(), nodes.end());
     nodes.erase(std::unique(nodes.begin(), nodes.end()), nodes.end());
@@ -164,39 +269,39 @@ struct SweepLists
     std::vector<TreeNodeIndex> computeIdx;               // parents computed at the end of each round
 };
 
-//! @brief relay shuffle lists of myRank, requires P a power of two and 1, 2 or 4 leaves per rank
+/*! @brief sweep lists of myRank for the cumulative rank bit masks of the rounds, requires P a power of two
+ *
+ * @param[in] masks  rank bits known after each round, the last one is P - 1, the first one the unit of ranks
+ */
 template<class KeyType, class T>
-SweepLists createSweepLists(OctreeView<const KeyType> tree, const SfcAssignment<KeyType>& assignment, float invThetaEff,
-                            T tol, const Box<T>& box, int myRank)
+SweepLists createSweepLists(OctreeView<const KeyType> tree, const SfcAssignment<KeyType>& assignment,
+                            std::span<const int> masks, float invThetaEff, T tol, const Box<T>& box, int myRank)
 {
-    int numRanks  = assignment.numRanks();
-    int lpr       = tree.numLeafNodes / numRanks;
-    int numRounds = maxDepth(tree.levelRange, maxTreeLevel<KeyType>{} + 2);
-    assert(std::has_single_bit(unsigned(numRanks)) && (lpr == 1 || lpr == 2 || lpr == 4));
+    assert(std::has_single_bit(unsigned(assignment.numRanks())));
 
     SweepLists lists;
     lists.sendOffsets = lists.recvOffsets = lists.computeOffsets = lists.sendDispl = lists.recvDispl = {0};
 
-    for (int round = 1; round <= numRounds; ++round)
+    for (int t = 0; t < int(masks.size()); ++t)
     {
-        // partners differ from myRank only in the rank bits of this round, at most 7 partners
-        int low   = lowBits(lpr, round);
-        int first = std::max(0, lowBits(lpr, round - 1));
-        int group = (1 << low) - (1 << first);
-        int base  = myRank & ~group;
+        // partners differ from myRank only in the new bits of this round
+        int prevMask = t ? masks[t - 1] : 0;
+        int fresh    = masks[t] & ~prevMask;
+        int recvMask = masks[t] & ~masks[0];
+        int base     = myRank & ~fresh;
 
-        auto myReceivers = receiverBoxes(assignment, myRank, low);
-        bool myParent    = computesParent(tree, assignment, myRank, round, myReceivers, invThetaEff, tol, box);
+        auto myReceivers = receiverBoxes(assignment, myRank, recvMask);
 
-        for (int peer = base; peer <= (base | group); peer += 1 << first)
+        unsigned sub = 0;
+        do
         {
+            int peer = base | int(sub);
+            sub      = (sub - fresh) & fresh;
             if (peer == myRank) { continue; }
 
-            auto peerReceivers = receiverBoxes(assignment, peer, low);
-            bool peerParent    = computesParent(tree, assignment, peer, round, peerReceivers, invThetaEff, tol, box);
-            auto sendNodes =
-                messageNodes(tree, assignment, myRank, round, peerReceivers, peerParent, invThetaEff, tol, box);
-            auto recvNodes = messageNodes(tree, assignment, peer, round, myReceivers, myParent, invThetaEff, tol, box);
+            auto peerReceivers = receiverBoxes(assignment, peer, recvMask);
+            auto sendNodes = messageNodes(tree, assignment, myRank, prevMask, peerReceivers, invThetaEff, tol, box);
+            auto recvNodes = messageNodes(tree, assignment, peer, prevMask, myReceivers, invThetaEff, tol, box);
             if (!sendNodes.empty())
             {
                 lists.sendPeers.push_back(peer);
@@ -209,16 +314,12 @@ SweepLists createSweepLists(OctreeView<const KeyType> tree, const SfcAssignment<
                 lists.recvIdx.insert(lists.recvIdx.end(), recvNodes.begin(), recvNodes.end());
                 lists.recvDispl.push_back(lists.recvIdx.size());
             }
-        }
+        } while (sub != 0);
         lists.sendOffsets.push_back(lists.sendPeers.size());
         lists.recvOffsets.push_back(lists.recvPeers.size());
 
-        if (myParent)
-        {
-            // parent of the covers exchanged in this round
-            KeyType parent = encodePlaceholderBit(assignment[myRank], 3 * (numRounds - round));
-            lists.computeIdx.push_back(locateNode(parent, tree.prefixes, tree.levelRange));
-        }
+        auto parents = computeNodes(tree, assignment, masks, t, myRank, myReceivers, invThetaEff, tol, box);
+        lists.computeIdx.insert(lists.computeIdx.end(), parents.begin(), parents.end());
         lists.computeOffsets.push_back(lists.computeIdx.size());
     }
     return lists;

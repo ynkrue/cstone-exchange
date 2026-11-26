@@ -56,7 +56,7 @@ int main(int argc, char** argv)
                 checkGpuErrors(cudaGetLastError());
             }
         };
-        status = testGlobalExchange<DeviceVector>(exec, upsweepFunction, upsweepNodes, rank, numRanks);
+        status = testGlobalExchange<DeviceVector>(exec, upsweepFunction, upsweepNodes, rank, numRanks, 1);
     }
     MPI_Finalize();
     return status;

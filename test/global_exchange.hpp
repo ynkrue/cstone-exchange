@@ -81,7 +81,8 @@ void populate(int rep, std::span<T> leafQ)
 }
 
 template<template<class...> class Vector, class Exec, class UpsweepFunction, class UpsweepNodes>
-int testGlobalExchange(Exec exec, UpsweepFunction upsweepFunction, UpsweepNodes upsweepNodes, int rank, int numRanks)
+int testGlobalExchange(Exec exec, UpsweepFunction upsweepFunction, UpsweepNodes upsweepNodes, int rank, int numRanks,
+                       int ranksPerUnit)
 {
     using KeyType      = unsigned;
     constexpr int reps = 10;
@@ -134,7 +135,9 @@ int testGlobalExchange(Exec exec, UpsweepFunction upsweepFunction, UpsweepNodes 
     ///! Relay setup
     MPI_Barrier(MPI_COMM_WORLD);
     double start     = MPI_Wtime();
-    auto   lists     = createSweepLists<KeyType>(hostTree, assignment, invThetaEff, tol, box, rank);
+    auto   masks     = ranksPerUnit == 1 ? levelMasks(numRanks, hostTree.numLeafNodes / numRanks)
+                                         : roundMasks(numRanks, ranksPerUnit - 1);
+    auto   lists     = createSweepLists<KeyType>(hostTree, assignment, masks, invThetaEff, tol, box, rank);
     double setupTime = MPI_Wtime() - start;
 
     Vector<TreeNodeIndex> sendIdx(lists.sendIdx), recvIdx(lists.recvIdx);
@@ -240,6 +243,12 @@ int testGlobalExchange(Exec exec, UpsweepFunction upsweepFunction, UpsweepNodes 
     {
         std::printf("tree: P %d, %d leaves, %d leaves/rank, Q %zu B, theta 1.1, tol %g, periodic box\n", numRanks,
                     hostTree.numLeafNodes, numLeaves, sizeof(Q), tol);
+        std::printf("round masks: ");
+        for (std::size_t t = 0; t < masks.size(); ++t)
+        {
+            std::printf(t ? " %x" : "%x", masks[t]);
+        }
+        std::printf("\n");
         std::printf("p2p setup [ms]: %.3f\n", setupTime * 1e3);
         std::printf("far nodes, send msgs, recv msgs (max / mean): %ld / %.1f, %ld / %.1f, %ld / %.1f\n", maxCounts[0],
                     double(sumCounts[0]) / numRanks, maxCounts[1], double(sumCounts[1]) / numRanks, maxCounts[2],

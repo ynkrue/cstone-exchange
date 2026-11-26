@@ -28,7 +28,9 @@ int main(int argc, char** argv)
             q[n] = CombineSum{}(n, children[n], q);
         }
     };
-    int status = testGlobalExchange<std::vector>(execution::cpu, upsweepFunction, upsweepNodes, rank, numRanks);
+    int ranksPerUnit = argc > 1 ? std::atoi(argv[1]) : 1;
+    int status =
+        testGlobalExchange<std::vector>(execution::cpu, upsweepFunction, upsweepNodes, rank, numRanks, ranksPerUnit);
     MPI_Finalize();
     return status;
 }
