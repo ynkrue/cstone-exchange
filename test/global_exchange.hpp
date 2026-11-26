@@ -91,7 +91,7 @@ template<template<class...> class Vector, class Exec, class UpsweepFunction, cla
          class StoreNodePeer, class SyncNode>
 int testGlobalExchange(Exec exec, UpsweepFunction upsweepFunction, UpsweepNodes upsweepNodes, AllocQ allocGlobQ,
                        int directMask, StoreNodePeer storeNodePeer, SyncNode syncNode, int rank, int numRanks,
-                       MPI_Comm nodeComm)
+                       MPI_Comm nodeComm, int extraLevels = 0)
 {
     using KeyType      = unsigned;
     constexpr int reps = 10;
@@ -103,8 +103,24 @@ int testGlobalExchange(Exec exec, UpsweepFunction upsweepFunction, UpsweepNodes 
     {
         boundaries[r] = KeyType(r) * stride;
     }
-    boundaries.back()                          = nodeRange<KeyType>(0);
-    auto                                leaves = computeSpanningTree<KeyType>(boundaries);
+    boundaries.back() = nodeRange<KeyType>(0);
+    auto leaves       = computeSpanningTree<KeyType>(boundaries);
+    if (extraLevels > 0)
+    {
+        // uniform tree at the deepest level of the spanning tree plus the extra levels
+        unsigned level = 0;
+        for (std::size_t i = 0; i + 1 < leaves.size(); ++i)
+        {
+            level = std::max(level, treeLevel(leaves[i + 1] - leaves[i]));
+        }
+        level += extraLevels;
+        leaves.resize((std::size_t(1) << (3 * level)) + 1);
+        for (std::size_t i = 0; i + 1 < leaves.size(); ++i)
+        {
+            leaves[i] = KeyType(i) * nodeRange<KeyType>(level);
+        }
+        leaves.back() = nodeRange<KeyType>(0);
+    }
     std::vector<unsigned>               leafCounts(nNodes(leaves), 1);
     OctreeData<KeyType, execution::Cpu> tree;
     tree.resize(nNodes(leaves));

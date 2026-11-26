@@ -29,6 +29,7 @@ int main(int argc, char** argv)
         }
     };
     int      ranksPerNode = argc > 1 ? std::atoi(argv[1]) : 1;
+    int      extraLevels  = argc > 2 ? std::atoi(argv[2]) : 0;
     MPI_Comm nodeComm;
     MPI_Comm_split(MPI_COMM_WORLD, rank / ranksPerNode, rank, &nodeComm);
     std::vector<Q> globQ;
@@ -39,8 +40,8 @@ int main(int argc, char** argv)
     };
     auto storeNodePeer = [](int, std::span<const TreeNodeIndex>) {};
     auto syncNode      = [] {};
-    int  status        = testGlobalExchange<std::vector>(execution::cpu, upsweepFunction, upsweepNodes, allocGlobQ, 0,
-                                                         storeNodePeer, syncNode, rank, numRanks, nodeComm);
+    int  status = testGlobalExchange<std::vector>(execution::cpu, upsweepFunction, upsweepNodes, allocGlobQ, 0,
+                                                  storeNodePeer, syncNode, rank, numRanks, nodeComm, extraLevels);
     MPI_Comm_free(&nodeComm);
     MPI_Finalize();
     return status;

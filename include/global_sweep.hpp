@@ -104,17 +104,19 @@ bool needs(KeyType prefix, bool isLeaf, std::span<const IBox> targets, float inv
 
 /*! @brief cumulative rank bits known after each round of the level schedule, 3 bits per tree level
  *
- * The first mask is 0, so round 0 is the local upsweep. 3 bits per round (radix 8) is the time optimum of the rank
+ * The first mask is 0, so round 0 has no messages. 3 bits per round (radix 8) is the time optimum of the rank
  * relay in the LogGP model and coincides with one tree level per round (see .claude/docs/model.md Proposition 2).
- * Requires numRanks * leavesPerRank to be a power of 8.
+ * The first group has the bits that complete the tree level above the nodes of a rank, 3 - log2(leavesPerRank) mod 3,
+ * and 3 if that is 0. The last group is truncated. Requires numRanks and leavesPerRank to be powers of two.
  */
 inline std::vector<int> levelMasks(int numRanks, int leavesPerRank)
 {
     int              rankBits = std::countr_zero(unsigned(numRanks));
     std::vector<int> masks{0};
-    for (int bits = 3 - std::countr_zero(unsigned(leavesPerRank)); bits <= rankBits; bits += 3)
+    for (int bits = 3 - std::countr_zero(unsigned(leavesPerRank)) % 3;; bits += 3)
     {
-        masks.push_back((1 << bits) - 1);
+        masks.push_back((1 << std::min(bits, rankBits)) - 1);
+        if (bits >= rankBits) { break; }
     }
     return masks;
 }
@@ -187,16 +189,17 @@ std::vector<TreeNodeIndex> coverNodes(OctreeView<const KeyType> tree, const SfcA
 /*! @brief internal nodes rank computes at the end of round t, deepest first
  *
  * The nodes of the cover of rank with masks[t] that no single partner knows before the round and that are needed
- * by the receivers of rank or implied by a needed ancestor. Round 0 computes all internal nodes of the cover.
+ * by the receivers of rank or implied by a needed ancestor. Round -1 is the local upsweep, it computes the internal
+ * nodes inside the range of rank.
  */
 template<class KeyType, class T>
 std::vector<TreeNodeIndex> computeNodes(OctreeView<const KeyType> tree, const SfcAssignment<KeyType>& assignment,
                                         std::span<const int> masks, int t, int rank, std::span<const IBox> receivers,
                                         float invThetaEff, T tol, const Box<T>& box)
 {
-    int prevMask = t ? masks[t - 1] : 0;
+    int prevMask = t > 0 ? masks[t - 1] : 0;
 
-    std::vector<TreeNodeIndex> nodes, stack = coverNodes(tree, assignment, rank, masks[t]);
+    std::vector<TreeNodeIndex> nodes, stack = coverNodes(tree, assignment, rank, t < 0 ? 0 : masks[t]);
     while (!stack.empty())
     {
         TreeNodeIndex i = stack.back();
@@ -204,7 +207,7 @@ std::vector<TreeNodeIndex> computeNodes(OctreeView<const KeyType> tree, const Sf
         KeyType prefix = tree.prefixes[i];
         if (tree.childOffsets[i] == 0) { continue; }
         int first = assignment.findRank(decodePlaceholderBit(prefix));
-        if (t > 0 && knownRanks(assignment, prefix, first, prevMask) == 2) { continue; }
+        if (t >= 0 && knownRanks(assignment, prefix, first, prevMask) == 2) { continue; }
 
         // the root has no parent for the MAC test and nobody needs it
         if (i != 0 && covered(prefix, false, receivers, invThetaEff, tol, box)) { nodes.push_back(i); }
@@ -344,6 +347,16 @@ SweepLists createSweepLists(OctreeView<const KeyType> tree, const SfcAssignment<
         lists.sendOffsets.push_back(lists.sendPeers.size());
         lists.recvOffsets.push_back(lists.recvPeers.size());
     };
+
+    // the local upsweep is its own phase when the ranges hold internal nodes, the same on all ranks
+    auto ownCover = coverNodes(tree, assignment, myRank, 0);
+    if (std::any_of(ownCover.begin(), ownCover.end(), [&](TreeNodeIndex i) { return tree.childOffsets[i] != 0; }))
+    {
+        lists.computeIdx = computeNodes(tree, assignment, masks, -1, myRank, receiverBoxes(assignment, myRank, 0),
+                                        invThetaEff, tol, box);
+        lists.computeOffsets.push_back(lists.computeIdx.size());
+        endPhase();
+    }
 
     for (int t = 0; t < int(masks.size()); ++t)
     {
