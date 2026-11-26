@@ -1,3 +1,16 @@
+/*
+ * Cornerstone octree
+ *
+ * Copyright (c) 2024 CSCS, ETH Zurich
+ *
+ * Please, refer to the LICENSE file in the root directory.
+ * SPDX-License-Identifier: MIT License
+ */
+
+/*! @file
+ * @brief CPU driver of the global sweep test
+ */
+
 #include "global_exchange.hpp"
 
 int main(int argc, char** argv)
@@ -6,16 +19,16 @@ int main(int argc, char** argv)
     int rank, numRanks;
     MPI_Comm_rank(MPI_COMM_WORLD, &rank);
     MPI_Comm_size(MPI_COMM_WORLD, &numRanks);
-    auto upsweep = [](std::span<const TreeNodeIndex> ranges, const TreeNodeIndex* children, Q* q)
-    { cstone::upsweep(ranges, children, q, SumChildren{}); };
-    auto computeParents = [](std::span<const TreeNodeIndex> nodes, const TreeNodeIndex* children, Q* q)
+    auto upsweepFunction = [](std::span<const TreeNodeIndex> ranges, const TreeNodeIndex* children, Q* q)
+    { cstone::upsweep(ranges, children, q, CombineSum{}); };
+    auto upsweepNodes = [](std::span<const TreeNodeIndex> nodes, const TreeNodeIndex* children, Q* q)
     {
         for (TreeNodeIndex n : nodes)
         {
-            q[n] = SumChildren{}(n, children[n], q);
+            q[n] = CombineSum{}(n, children[n], q);
         }
     };
-    int status = testGlobalExchange<std::vector>(execution::cpu, upsweep, computeParents, rank, numRanks);
+    int status = testGlobalExchange<std::vector>(execution::cpu, upsweepFunction, upsweepNodes, rank, numRanks);
     MPI_Finalize();
     return status;
 }
