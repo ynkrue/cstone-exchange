@@ -28,7 +28,8 @@ int main(int argc, char** argv)
             q[n] = CombineSum{}(n, children[n], q);
         }
     };
-    int status = testGlobalExchange<std::vector>(execution::cpu, upsweepFunction, upsweepNodes, rank, numRanks);
+    int steps  = argc > 1 ? std::atoi(argv[1]) : 10;
+    int status = testGlobalExchange<std::vector>(execution::cpu, upsweepFunction, upsweepNodes, rank, numRanks, steps);
     MPI_Finalize();
     return status;
 }
