@@ -21,6 +21,7 @@
 #include <cmath>
 #include <span>
 #include <stdexcept>
+#include <type_traits>
 #include <vector>
 #include <mpi.h>
 
@@ -441,16 +442,19 @@ SweepLists createSweepLists(OctreeView<const KeyType> tree, const SfcAssignment<
  *                                 it first waits until all node peers have finished the scatters of the phase, also
  *                                 for empty nodes
  * @param[in]    directMask        masks[0] of the lists if the node peers are reachable by direct access, else 0
- * @param[in]    loadNodePeer      loadNodePeer(peer, nodes) writes globQ[n] of peer into globQ[n] of this rank
+ * @param[in]    pullNodePeers     pullNodePeers(peers, displ, nodes) waits until the own range of all node peers is
+ *                                 final, then writes globQ[n] of peers[i] into globQ[n] of this rank for n in
+ *                                 nodes[displ[i], displ[i+1])
  * @param[in]    scatterNodePeers  scatterNodePeers(nodes, values) writes values[i] into globQ[nodes[i]] of all node
  *                                 peers and this rank
- * @param[in]    syncNode          returns when the own range of all node peers is final
+ * @param[in]    streamPhase       streamPhase(sendPeers, sendDispl, sendBuf, recvPeers, recvDispl, recvBuf) enqueues the
+ *                                 messages of a phase on the stream of exec, nullptr selects MPI
  */
-template<class Exec, class Q, class UpsweepNodes, class LoadNodePeer, class ScatterNodePeers, class SyncNode>
+template<class Exec, class Q, class UpsweepNodes, class PullNodePeers, class ScatterNodePeers, class StreamPhase>
 void globalSweep(Exec exec, const SweepLists& lists, std::span<const TreeNodeIndex> sendIdx,
                  std::span<const TreeNodeIndex> recvIdx, std::span<Q> globQ, std::span<Q> sendBuf, std::span<Q> recvBuf,
-                 UpsweepNodes&& upsweepNodes, int directMask, LoadNodePeer&& loadNodePeer,
-                 ScatterNodePeers&& scatterNodePeers, SyncNode&& syncNode, int tag, MPI_Comm comm)
+                 UpsweepNodes&& upsweepNodes, int directMask, PullNodePeers&& pullNodePeers,
+                 ScatterNodePeers&& scatterNodePeers, StreamPhase&& streamPhase, int tag, MPI_Comm comm)
 {
     int  numPhases = int(lists.sendOffsets.size()) - 1;
     bool direct    = directMask != 0;
@@ -460,17 +464,22 @@ void globalSweep(Exec exec, const SweepLists& lists, std::span<const TreeNodeInd
                          lists.computeIdx.data() + lists.computeOffsets[phase + 1]);
     };
 
+    constexpr bool viaStream = !std::is_null_pointer_v<std::decay_t<StreamPhase>>;
+
     // post all receives first, one request per message, none for the node block and pool phases of direct peers
     std::vector<MPI_Request> recvRequests, sendRequests;
-    for (int phase = 0; phase < numPhases; ++phase)
+    if constexpr (!viaStream)
     {
-        for (TreeNodeIndex m = lists.recvOffsets[phase]; m < lists.recvOffsets[phase + 1]; ++m)
+        for (int phase = 0; phase < numPhases; ++phase)
         {
-            if (direct && phase % 2) { recvRequests.push_back(MPI_REQUEST_NULL); }
-            else
+            for (TreeNodeIndex m = lists.recvOffsets[phase]; m < lists.recvOffsets[phase + 1]; ++m)
             {
-                mpiRecvAsync(recvBuf.data() + lists.recvDispl[m], lists.recvDispl[m + 1] - lists.recvDispl[m],
-                             lists.recvPeers[m], tag, recvRequests, comm);
+                if (direct && phase % 2) { recvRequests.push_back(MPI_REQUEST_NULL); }
+                else
+                {
+                    mpiRecvAsync(recvBuf.data() + lists.recvDispl[m], lists.recvDispl[m + 1] - lists.recvDispl[m],
+                                 lists.recvPeers[m], tag, recvRequests, comm);
+                }
             }
         }
     }
@@ -481,12 +490,9 @@ void globalSweep(Exec exec, const SweepLists& lists, std::span<const TreeNodeInd
     {
         // the pulled nodes lie in the ranges of the peers and are final after the sync, later scatters write outside
         // them, and the next step starts after the last sync of this one, so the pull needs no second sync
-        syncNode();
-        for (TreeNodeIndex m = lists.recvOffsets[1]; m < lists.recvOffsets[2]; ++m)
-        {
-            loadNodePeer(lists.recvPeers[m],
-                         recvIdx.subspan(lists.recvDispl[m], lists.recvDispl[m + 1] - lists.recvDispl[m]));
-        }
+        TreeNodeIndex first = lists.recvOffsets[1], last = lists.recvOffsets[2];
+        pullNodePeers(std::span(lists.recvPeers).subspan(first, last - first),
+                      std::span(lists.recvDispl).subspan(first, last - first + 1), recvIdx);
         upsweepNodes(parents(1), globQ.data(), false);
     }
 
@@ -497,25 +503,41 @@ void globalSweep(Exec exec, const SweepLists& lists, std::span<const TreeNodeInd
         // with direct node peers the network phase scatters into all node peers, so the pool phase has no messages
         bool          pool      = direct && phase % 2;
         TreeNodeIndex sendFirst = lists.sendOffsets[phase], sendLast = lists.sendOffsets[phase + 1];
+        TreeNodeIndex recvFirst = lists.recvOffsets[phase], recvLast = lists.recvOffsets[phase + 1];
         if (!pool && sendFirst != sendLast)
         {
             TreeNodeIndex first = lists.sendDispl[sendFirst];
             TreeNodeIndex count = lists.sendDispl[sendLast] - first;
             gather(exec, sendIdx.subspan(first, count), globQ.data(), sendBuf.data() + first);
-            if constexpr (execution::HaveGpu<Exec>{}) { syncGpu(exec); }
-            for (TreeNodeIndex m = sendFirst; m < sendLast; ++m)
+            if constexpr (!viaStream)
             {
-                mpiSendAsync(sendBuf.data() + lists.sendDispl[m], lists.sendDispl[m + 1] - lists.sendDispl[m],
-                             lists.sendPeers[m], tag, sendRequests, comm);
+                if constexpr (execution::HaveGpu<Exec>{}) { syncGpu(exec); }
+                for (TreeNodeIndex m = sendFirst; m < sendLast; ++m)
+                {
+                    mpiSendAsync(sendBuf.data() + lists.sendDispl[m], lists.sendDispl[m + 1] - lists.sendDispl[m],
+                                 lists.sendPeers[m], tag, sendRequests, comm);
+                }
+            }
+        }
+        if constexpr (viaStream)
+        {
+            if (!pool)
+            {
+                streamPhase(std::span(lists.sendPeers).subspan(sendFirst, sendLast - sendFirst),
+                            std::span(lists.sendDispl).subspan(sendFirst, sendLast - sendFirst + 1), sendBuf.data(),
+                            std::span(lists.recvPeers).subspan(recvFirst, recvLast - recvFirst),
+                            std::span(lists.recvDispl).subspan(recvFirst, recvLast - recvFirst + 1), recvBuf.data());
             }
         }
 
-        TreeNodeIndex recvFirst = lists.recvOffsets[phase], recvLast = lists.recvOffsets[phase + 1];
         if (!pool && recvFirst != recvLast)
         {
             TreeNodeIndex first = lists.recvDispl[recvFirst];
             TreeNodeIndex count = lists.recvDispl[recvLast] - first;
-            MPI_Waitall(recvLast - recvFirst, recvRequests.data() + recvFirst, MPI_STATUSES_IGNORE);
+            if constexpr (!viaStream)
+            {
+                MPI_Waitall(recvLast - recvFirst, recvRequests.data() + recvFirst, MPI_STATUSES_IGNORE);
+            }
             if (direct) { scatterNodePeers(recvIdx.subspan(first, count), recvBuf.data() + first); }
             else
             {
@@ -528,9 +550,12 @@ void globalSweep(Exec exec, const SweepLists& lists, std::span<const TreeNodeInd
         upsweepNodes(parents(phase), globQ.data(), pool);
     }
 
-    // the last scatter must finish before the next sweep receives into recvBuf
-    if constexpr (execution::HaveGpu<Exec>{}) { syncGpu(exec); }
-    MPI_Waitall(int(sendRequests.size()), sendRequests.data(), MPI_STATUSES_IGNORE);
+    // without stream phases the last scatter must finish before the next sweep receives into recvBuf
+    if constexpr (!viaStream)
+    {
+        if constexpr (execution::HaveGpu<Exec>{}) { syncGpu(exec); }
+        MPI_Waitall(int(sendRequests.size()), sendRequests.data(), MPI_STATUSES_IGNORE);
+    }
 }
 
 } // namespace global_sweep

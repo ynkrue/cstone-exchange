@@ -32,7 +32,7 @@ set(NVSHMEM_HOME /user-environment/env/default CACHE PATH "NVSHMEM install prefi
 file(GLOB GTL_LIB_DIR /user-environment/linux-neoverse_v2/cray-gtl-*/lib) # not in the uenv view
 target_include_directories(test_global_exchange_gpu PRIVATE "${NVSHMEM_HOME}/include")
 target_link_directories(test_global_exchange_gpu PRIVATE "${NVSHMEM_HOME}/lib" ${GTL_LIB_DIR})
-target_link_libraries(test_global_exchange_gpu PRIVATE nvshmem_host nvshmem_device mpi_gtl_cuda)
+target_link_libraries(test_global_exchange_gpu PRIVATE nvshmem_host nvshmem_device nccl mpi_gtl_cuda)
 target_link_options(test_global_exchange_gpu PRIVATE "LINKER:-rpath=${GTL_LIB_DIR}")
 set_target_properties(test_global_exchange_gpu PROPERTIES CUDA_SEPARABLE_COMPILATION ON)
 

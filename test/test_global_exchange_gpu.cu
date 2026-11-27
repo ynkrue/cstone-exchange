@@ -12,6 +12,8 @@
  */
 
 #include <cstdint>
+#include <cstring>
+#include <nccl.h>
 #include <nvshmem.h>
 #include <nvshmemx.h>
 #include "cstone/cuda/cuda_utils.cuh"
@@ -37,11 +39,39 @@ __global__ void sumParents(TreeNodeIndex first, const TreeNodeIndex* children, Q
     reinterpret_cast<double*>(q)[std::size_t(i) * numComponents + threadIdx.x] = sum;
 }
 
-//! @brief node nodes[i] of globQ = node nodes[i] of peerQ
-__global__ void loadNodePeerKernel(const TreeNodeIndex* nodes, const Q* peerQ, Q* globQ)
+// messages of the node block, passed by value, src[i] is the globQ of the peer of message i
+constexpr int maxPullMessages = 32;
+struct PullMessages
 {
-    TreeNodeIndex n                                   = nodes[blockIdx.x];
-    reinterpret_cast<double*>(globQ + n)[threadIdx.x] = reinterpret_cast<const double*>(peerQ + n)[threadIdx.x];
+    int           count;
+    TreeNodeIndex displ[maxPullMessages + 1];
+    const Q*      src[maxPullMessages];
+};
+
+/*! @brief syncs with the node peers like syncNodeKernel, then block (x, y) copies nodes[displ[y] + x] of message y
+ *
+ * Every block signals before it waits. CUDA does not guarantee that a given block runs while others spin, and setting
+ * the same count again does not change the slot.
+ */
+__global__ void pullNodePeersKernel(PullMessages msgs, const TreeNodeIndex* nodes, Q* globQ, uint64_t* signal,
+                                    const int* peerPes, int myPos, int numPeers, uint64_t count)
+{
+    int m = threadIdx.x;
+    if (m < numPeers && m != myPos)
+    {
+        __threadfence_system();
+        nvshmemx_signal_op(signal + myPos, count, NVSHMEM_SIGNAL_SET, peerPes[m]);
+        nvshmem_signal_wait_until(signal + m, NVSHMEM_CMP_GE, count);
+    }
+    __threadfence();
+    __syncthreads();
+
+    int y = blockIdx.y;
+    if (y < msgs.count && msgs.displ[y] + int(blockIdx.x) < msgs.displ[y + 1])
+    {
+        TreeNodeIndex n = nodes[msgs.displ[y] + blockIdx.x];
+        globQ[n][threadIdx.x] = msgs.src[y][n][threadIdx.x];
+    }
 }
 
 //! @brief node nodes[i] of every peerQ[m] = values[i]
@@ -109,6 +139,16 @@ __global__ void syncNodeKernel(uint64_t* signal, const int* peerPes, int myPos, 
     nvshmemx_signal_op(signal + myPos, count, NVSHMEM_SIGNAL_SET, peerPes[m]);
     nvshmem_signal_wait_until(signal + m, NVSHMEM_CMP_GE, count);
 }
+
+//! @brief abort on an NCCL error
+void checkNccl(ncclResult_t result)
+{
+    if (result != ncclSuccess)
+    {
+        std::fprintf(stderr, "NCCL error: %s\n", ncclGetErrorString(result));
+        MPI_Abort(MPI_COMM_WORLD, 1);
+    }
+}
 } // namespace
 
 int main(int argc, char** argv)
@@ -139,6 +179,16 @@ int main(int argc, char** argv)
     Q*        globQ      = nullptr;
     Q**       nodePeerQ  = nullptr; // device array of the globQ pointers of the node peers
     int       status;
+
+    bool       useNccl = argc > 2 && std::strcmp(argv[2], "nccl") == 0;
+    ncclComm_t ncclComm = nullptr;
+    if (useNccl)
+    {
+        ncclUniqueId id;
+        if (rank == 0) { checkNccl(ncclGetUniqueId(&id)); }
+        MPI_Bcast(&id, sizeof(id), MPI_BYTE, 0, MPI_COMM_WORLD);
+        checkNccl(ncclCommInitRank(&ncclComm, numRanks, id, rank));
+    }
     {
         StreamHolder      stream;
         auto              exec = stream.exec();
@@ -198,16 +248,61 @@ int main(int argc, char** argv)
                                                                              numNodePeers);
             checkGpuErrors(cudaGetLastError());
         };
-        auto loadNodePeer = [&](int peer, std::span<const TreeNodeIndex> nodes)
+        auto pullNodePeers = [&](std::span<const int> peers, std::span<const TreeNodeIndex> displ,
+                                 std::span<const TreeNodeIndex> nodes)
         {
-            loadNodePeerKernel<<<nodes.size(), numComponents, 0, exec>>>(nodes.data(), peerQ[peer], globQ);
+            if (peers.size() > maxPullMessages)
+            {
+                std::fprintf(stderr, "too many node peers for one pull\n");
+                MPI_Abort(MPI_COMM_WORLD, 1);
+            }
+            PullMessages  msgs;
+            TreeNodeIndex maxNodes = 1;
+            msgs.count             = int(peers.size());
+            for (int i = 0; i < msgs.count; ++i)
+            {
+                msgs.displ[i] = displ[i];
+                msgs.src[i]   = peerQ[peers[i]];
+                maxNodes      = std::max(maxNodes, displ[i + 1] - displ[i]);
+            }
+            msgs.displ[msgs.count] = displ[msgs.count];
+            pullNodePeersKernel<<<dim3(maxNodes, std::max(msgs.count, 1)), numComponents, 0, exec>>>(
+                msgs, nodes.data(), globQ, nodeSignal, nodePeerPes.data(), myPos, numNodePeers, ++numSyncs);
             checkGpuErrors(cudaGetLastError());
         };
         int steps = argc > 1 ? std::atoi(argv[1]) : 10;
-        status = testGlobalExchange<DeviceVector>(exec, upsweepFunction, upsweepNodes, rank, numRanks, steps,
-                                                  nodeComm, allocGlobQ, nodeMask(rank, nodeComm), loadNodePeer,
-                                                  scatterNodePeers, syncNode);
+        auto run  = [&](auto streamPhase)
+        {
+            return testGlobalExchange<DeviceVector>(exec, upsweepFunction, upsweepNodes, rank, numRanks, steps,
+                                                    nodeComm, allocGlobQ, nodeMask(rank, nodeComm), pullNodePeers,
+                                                    scatterNodePeers, streamPhase);
+        };
+        if (rank == 0) { std::printf("transport: %s\n", useNccl ? "nccl" : "mpi"); }
+        if (useNccl)
+        {
+            // grouped sends and receives of a phase on the stream of the sweep kernels
+            auto ncclPhase = [&](std::span<const int> sendPeers, std::span<const TreeNodeIndex> sendDispl,
+                                 Q* sendBuf, std::span<const int> recvPeers, std::span<const TreeNodeIndex> recvDispl,
+                                 Q* recvBuf)
+            {
+                checkNccl(ncclGroupStart());
+                for (std::size_t i = 0; i < recvPeers.size(); ++i)
+                {
+                    checkNccl(ncclRecv(recvBuf + recvDispl[i], (recvDispl[i + 1] - recvDispl[i]) * sizeof(Q),
+                                       ncclUint8, recvPeers[i], ncclComm, exec));
+                }
+                for (std::size_t i = 0; i < sendPeers.size(); ++i)
+                {
+                    checkNccl(ncclSend(sendBuf + sendDispl[i], (sendDispl[i + 1] - sendDispl[i]) * sizeof(Q),
+                                       ncclUint8, sendPeers[i], ncclComm, exec));
+                }
+                checkNccl(ncclGroupEnd());
+            };
+            status = run(ncclPhase);
+        }
+        else { status = run(nullptr); }
     }
+    if (useNccl) { checkNccl(ncclCommDestroy(ncclComm)); }
     checkGpuErrors(cudaFree(nodePeerQ));
     nvshmem_free(globQ);
     nvshmem_free(nodeSignal);
