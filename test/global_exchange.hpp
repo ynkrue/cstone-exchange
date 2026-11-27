@@ -83,14 +83,15 @@ void populate(int step, std::span<T> leafQ)
 /*! @brief run the sweep test
  *
  * @param[in] allocGlobQ   allocGlobQ(numNodes) returns the zeroed node values of this rank in the execution space
+ * @param[in] direct       true if the node peers are reachable by direct access
  * @param[in] extraLevels  uniform tree levels below the deepest level of the spanning tree, 0 for the spanning tree
  *
- * directMask, pullNodePeers and scatterNodePeers go to globalSweep.
+ * direct, pullNodePeers, scatterNodePeers and streamPhase go to globalSweep.
  */
 template<template<class...> class Vector, class Exec, class UpsweepFunction, class UpsweepNodes, class AllocQ,
          class PullNodePeers, class ScatterNodePeers, class StreamPhase>
 int testGlobalExchange(Exec exec, UpsweepFunction upsweepFunction, UpsweepNodes upsweepNodes, int rank, int numRanks,
-                       int steps, MPI_Comm nodeComm, AllocQ allocGlobQ, int directMask, PullNodePeers pullNodePeers,
+                       int steps, MPI_Comm nodeComm, AllocQ allocGlobQ, bool direct, PullNodePeers pullNodePeers,
                        ScatterNodePeers scatterNodePeers, StreamPhase streamPhase, int extraLevels = 0)
 {
     using KeyType = unsigned;
@@ -102,8 +103,8 @@ int testGlobalExchange(Exec exec, UpsweepFunction upsweepFunction, UpsweepNodes 
     {
         boundaries[r] = KeyType(r) * stride;
     }
-    boundaries.back() = nodeRange<KeyType>(0);
-    auto leaves       = computeSpanningTree<KeyType>(boundaries);
+    boundaries.back()                          = nodeRange<KeyType>(0);
+    auto                                leaves = computeSpanningTree<KeyType>(boundaries);
     if (extraLevels > 0)
     {
         // uniform tree at the deepest level of the spanning tree plus the extra levels
@@ -220,7 +221,7 @@ int testGlobalExchange(Exec exec, UpsweepFunction upsweepFunction, UpsweepNodes 
             exec, lists, {sendIdx.data(), sendIdx.size()}, {recvIdx.data(), recvIdx.size()},
             std::span<Q>(globQ, hostTree.numNodes), {sendBuf.data(), sendBuf.size()},
             {recvBuf.data(), recvBuf.size()}, [&](std::span<const TreeNodeIndex> nodes, Q* q, bool syncFirst)
-            { upsweepNodes(nodes, gOctree.childOffsets, q, syncFirst); }, directMask, pullNodePeers, scatterNodePeers,
+            { upsweepNodes(nodes, gOctree.childOffsets, q, syncFirst); }, direct, pullNodePeers, scatterNodePeers,
             streamPhase, tag, MPI_COMM_WORLD);
         p2pHostTime[step] = MPI_Wtime() - start;
         if constexpr (execution::HaveGpu<Exec>{}) { syncGpu(exec); }

@@ -109,19 +109,17 @@ __global__ void sumParentsList(NodeList list, const TreeNodeIndex* children, Q* 
         __threadfence();
         __syncthreads();
     }
+    // the list holds internal nodes only
+    double* qd = reinterpret_cast<double*>(q);
     for (int i = 0; i < list.count; ++i)
     {
-        TreeNodeIndex n = list.nodes[i];
-        if (children[n])
+        TreeNodeIndex n   = list.nodes[i];
+        double        sum = 0;
+        for (int k = 0; k < 8; ++k)
         {
-            double* qd  = reinterpret_cast<double*>(q);
-            double  sum = qd[std::size_t(children[n]) * numComponents + threadIdx.x];
-            for (int k = 1; k < 8; ++k)
-            {
-                sum += qd[std::size_t(children[n] + k) * numComponents + threadIdx.x];
-            }
-            qd[std::size_t(n) * numComponents + threadIdx.x] = sum;
+            sum += qd[std::size_t(children[n] + k) * numComponents + threadIdx.x];
         }
+        qd[std::size_t(n) * numComponents + threadIdx.x] = sum;
     }
 }
 
@@ -168,6 +166,16 @@ int main(int argc, char** argv)
     std::vector<int> nodePeers(numNodePeers);
     MPI_Allgather(&rank, 1, MPI_INT, nodePeers.data(), 1, MPI_INT, nodeComm);
 
+    bool       useNccl  = argc > 2 && std::strcmp(argv[2], "nccl") == 0;
+    ncclComm_t ncclComm = nullptr;
+    if (useNccl)
+    {
+        ncclUniqueId id;
+        if (rank == 0) { checkNccl(ncclGetUniqueId(&id)); }
+        MPI_Bcast(&id, sizeof(id), MPI_BYTE, 0, MPI_COMM_WORLD);
+        checkNccl(ncclCommInitRank(&ncclComm, numRanks, id, rank));
+    }
+
     nvshmemx_init_attr_t attr  = NVSHMEMX_INIT_ATTR_INITIALIZER;
     MPI_Comm             world = MPI_COMM_WORLD;
     nvshmemx_set_attr_mpi_comm_args(&world, &attr);
@@ -179,16 +187,6 @@ int main(int argc, char** argv)
     Q*        globQ      = nullptr;
     Q**       nodePeerQ  = nullptr; // device array of the globQ pointers of the node peers
     int       status;
-
-    bool       useNccl = argc > 2 && std::strcmp(argv[2], "nccl") == 0;
-    ncclComm_t ncclComm = nullptr;
-    if (useNccl)
-    {
-        ncclUniqueId id;
-        if (rank == 0) { checkNccl(ncclGetUniqueId(&id)); }
-        MPI_Bcast(&id, sizeof(id), MPI_BYTE, 0, MPI_COMM_WORLD);
-        checkNccl(ncclCommInitRank(&ncclComm, numRanks, id, rank));
-    }
     {
         StreamHolder      stream;
         auto              exec = stream.exec();
@@ -271,36 +269,31 @@ int main(int argc, char** argv)
             checkGpuErrors(cudaGetLastError());
         };
         int steps = argc > 1 ? std::atoi(argv[1]) : 10;
-        auto run  = [&](auto streamPhase)
+        auto run = [&](auto streamPhase)
         {
             return testGlobalExchange<DeviceVector>(exec, upsweepFunction, upsweepNodes, rank, numRanks, steps,
-                                                    nodeComm, allocGlobQ, nodeMask(rank, nodeComm), pullNodePeers,
-                                                    scatterNodePeers, streamPhase);
+                                                    nodeComm, allocGlobQ, true, pullNodePeers, scatterNodePeers,
+                                                    streamPhase);
+        };
+        // grouped sends and receives of a phase on the stream of the sweep kernels
+        auto ncclPhase = [&](std::span<const int> sendPeers, std::span<const TreeNodeIndex> sendDispl, Q* sendBuf,
+                             std::span<const int> recvPeers, std::span<const TreeNodeIndex> recvDispl, Q* recvBuf)
+        {
+            checkNccl(ncclGroupStart());
+            for (std::size_t i = 0; i < recvPeers.size(); ++i)
+            {
+                checkNccl(ncclRecv(recvBuf + recvDispl[i], (recvDispl[i + 1] - recvDispl[i]) * sizeof(Q), ncclUint8,
+                                   recvPeers[i], ncclComm, exec));
+            }
+            for (std::size_t i = 0; i < sendPeers.size(); ++i)
+            {
+                checkNccl(ncclSend(sendBuf + sendDispl[i], (sendDispl[i + 1] - sendDispl[i]) * sizeof(Q), ncclUint8,
+                                   sendPeers[i], ncclComm, exec));
+            }
+            checkNccl(ncclGroupEnd());
         };
         if (rank == 0) { std::printf("transport: %s\n", useNccl ? "nccl" : "mpi"); }
-        if (useNccl)
-        {
-            // grouped sends and receives of a phase on the stream of the sweep kernels
-            auto ncclPhase = [&](std::span<const int> sendPeers, std::span<const TreeNodeIndex> sendDispl,
-                                 Q* sendBuf, std::span<const int> recvPeers, std::span<const TreeNodeIndex> recvDispl,
-                                 Q* recvBuf)
-            {
-                checkNccl(ncclGroupStart());
-                for (std::size_t i = 0; i < recvPeers.size(); ++i)
-                {
-                    checkNccl(ncclRecv(recvBuf + recvDispl[i], (recvDispl[i + 1] - recvDispl[i]) * sizeof(Q),
-                                       ncclUint8, recvPeers[i], ncclComm, exec));
-                }
-                for (std::size_t i = 0; i < sendPeers.size(); ++i)
-                {
-                    checkNccl(ncclSend(sendBuf + sendDispl[i], (sendDispl[i + 1] - sendDispl[i]) * sizeof(Q),
-                                       ncclUint8, sendPeers[i], ncclComm, exec));
-                }
-                checkNccl(ncclGroupEnd());
-            };
-            status = run(ncclPhase);
-        }
-        else { status = run(nullptr); }
+        status = useNccl ? run(ncclPhase) : run(nullptr);
     }
     if (useNccl) { checkNccl(ncclCommDestroy(ncclComm)); }
     checkGpuErrors(cudaFree(nodePeerQ));

@@ -43,8 +43,8 @@ int main(int argc, char** argv)
         [](std::span<const int>, std::span<const TreeNodeIndex>, std::span<const TreeNodeIndex>) {};
     auto scatterNodePeers = [](std::span<const TreeNodeIndex>, const Q*) {};
     int  status = testGlobalExchange<std::vector>(execution::cpu, upsweepFunction, upsweepNodes, rank, numRanks, steps,
-                                                  nodeComm, allocGlobQ, 0, pullNodePeers, scatterNodePeers, nullptr,
-                                                  extraLevels);
+                                                  nodeComm, allocGlobQ, false, pullNodePeers, scatterNodePeers,
+                                                  nullptr, extraLevels);
     MPI_Comm_free(&nodeComm);
     MPI_Finalize();
     return status;
