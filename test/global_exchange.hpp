@@ -84,15 +84,15 @@ void populate(int step, std::span<T> leafQ)
  *
  * @param[in] allocGlobQ     allocGlobQ(numNodes) returns the zeroed node values of this rank in the execution space
  * @param[in] directMask     rank bits of the node peers reachable by direct stores, 0 for none
- * @param[in] storeNodePeer  storeNodePeer(peer, nodes) writes globQ[n] of this rank into globQ[n] of peer
+ * @param[in] loadNodePeer   loadNodePeer(peer, nodes) writes globQ[n] of peer into globQ[n] of this rank
  * @param[in] scatterNodePeers  scatterNodePeers(nodes, values) writes values[i] into globQ[nodes[i]] of all node peers
- * @param[in] syncNode       returns when all node peers have finished their stores of the phase
+ * @param[in] syncNode       returns when all node peers have finished the phase they have in common
  * @param[in] steps          number of timed steps
  */
 template<template<class...> class Vector, class Exec, class UpsweepFunction, class UpsweepNodes, class AllocQ,
-         class StoreNodePeer, class ScatterNodePeers, class SyncNode>
+         class LoadNodePeer, class ScatterNodePeers, class SyncNode>
 int testGlobalExchange(Exec exec, UpsweepFunction upsweepFunction, UpsweepNodes upsweepNodes, AllocQ allocGlobQ,
-                       int directMask, StoreNodePeer storeNodePeer, ScatterNodePeers scatterNodePeers,
+                       int directMask, LoadNodePeer loadNodePeer, ScatterNodePeers scatterNodePeers,
                        SyncNode syncNode, int rank, int numRanks, MPI_Comm nodeComm, int steps,
                        int extraLevels = 0)
 {
@@ -224,7 +224,7 @@ int testGlobalExchange(Exec exec, UpsweepFunction upsweepFunction, UpsweepNodes 
             std::span<Q>(globQ, hostTree.numNodes), {sendBuf.data(), sendBuf.size()}, {recvBuf.data(), recvBuf.size()},
             [&](std::span<const TreeNodeIndex> nodes, Q* q, bool syncFirst)
             { upsweepNodes(nodes, gOctree.childOffsets, q, syncFirst); },
-            directMask, storeNodePeer, scatterNodePeers, syncNode, tag, MPI_COMM_WORLD);
+            directMask, loadNodePeer, scatterNodePeers, syncNode, tag, MPI_COMM_WORLD);
         p2pTime[step] = MPI_Wtime() - start;
 
         // check the far nodes and own leaves of this rank from the p2p sweep

@@ -361,10 +361,27 @@ SweepLists createSweepLists(OctreeView<const KeyType> tree, const SfcAssignment<
         endPhase(0);
     }
 
-    for (int t = 0; t < int(masks.size()); ++t)
+    // the exchange inside the node, the messages are the nodes of the own ranges
+    {
+        auto myReceivers = receiverBoxes(assignment, myRank, 0);
+        for (unsigned j = masks[0] & -masks[0]; j != 0; j = (j - masks[0]) & masks[0])
+        {
+            int peer = myRank ^ int(j);
+            addSend(peer, messageNodes(tree, assignment, myRank, 0, receiverBoxes(assignment, peer, 0), invThetaEff,
+                                       tol, box));
+            addRecv(peer, messageNodes(tree, assignment, peer, 0, myReceivers, invThetaEff, tol, box));
+        }
+        endPhase(1);
+
+        auto parents = computeNodes(tree, assignment, masks, 0, myRank, myReceivers, invThetaEff, tol, box);
+        lists.computeIdx.insert(lists.computeIdx.end(), parents.begin(), parents.end());
+        lists.computeOffsets.push_back(lists.computeIdx.size());
+    }
+
+    for (int t = 1; t < int(masks.size()); ++t)
     {
         // partners differ from myRank only in the new bits of this round
-        int prevMask = t ? masks[t - 1] : 0;
+        int prevMask = masks[t - 1];
         int fresh    = masks[t] & ~prevMask;
         int recvMask = masks[t] & ~masks[0];
 
@@ -376,7 +393,7 @@ SweepLists createSweepLists(OctreeView<const KeyType> tree, const SfcAssignment<
             unsigned k = 0;
             for (unsigned j = fresh & -fresh; j != 0; j = (j - fresh) & fresh)
             {
-                if (t == 0 || nodePeers[k % numNodePeers] == handler) { f(int(j)); }
+                if (nodePeers[k % numNodePeers] == handler) { f(int(j)); }
                 ++k;
             }
         };
@@ -393,10 +410,10 @@ SweepLists createSweepLists(OctreeView<const KeyType> tree, const SfcAssignment<
                 addRecv(peer, recvNodes);
                 received.insert(received.end(), recvNodes.begin(), recvNodes.end());
             });
-        endPhase(t == 0 ? 1 : 2);
+        endPhase(2);
 
         // the handlers pool the bundles of the node pairs to the other node peers, no compute in the first phase
-        if (t > 0 && numNodePeers > 1)
+        if (numNodePeers > 1)
         {
             lists.computeOffsets.push_back(lists.computeIdx.size());
             std::sort(received.begin(), received.end());
@@ -429,24 +446,24 @@ SweepLists createSweepLists(OctreeView<const KeyType> tree, const SfcAssignment<
 
 /*! @brief exchange the needed nodes of this rank round by round and compute the parents in between
  *
- * The phase kind decides how a phase communicates. Messages of node phases are direct stores into globQ of the
- * peer at the same node indices, so the receiver only syncs. Network messages are gathered and sent by MPI. With
- * direct stores the pool phases send nothing, the network phase scatters its received nodes into all node peers.
+ * The phase kind decides how a phase communicates. In the node phase the receiver pulls the nodes from globQ of the
+ * peer at the same node indices after a sync. Network messages are gathered and sent by MPI. With direct access
+ * the pool phases send nothing, the network phase scatters its received nodes into all node peers.
  *
  * @param[inout] globQ           values of all global nodes, own leaves set by the caller
  * @param[in]    upsweepNodes    upsweepNodes(nodes, globQ, syncFirst) sets nodes from their children, if syncFirst
- *                               it first waits until all node peers have finished their stores of the phase, also
+ *                               it first waits until all node peers have finished the preceding network phase, also
  *                               for empty nodes
- * @param[in]    directMask      rank bits of the node peers reachable by direct stores, 0 for none
- * @param[in]    storeNodePeer   storeNodePeer(peer, nodes) writes globQ[n] of this rank into globQ[n] of peer
+ * @param[in]    directMask      rank bits of the node peers reachable by direct access, 0 for none
+ * @param[in]    loadNodePeer    loadNodePeer(peer, nodes) writes globQ[n] of peer into globQ[n] of this rank
  * @param[in]    scatterNodePeers  scatterNodePeers(nodes, values) writes values[i] into globQ[nodes[i]] of all node
  *                                 peers and this rank, only called if directMask is not 0
- * @param[in]    syncNode        returns when the own leaves of all node peers are set, only called at the start
+ * @param[in]    syncNode        returns when the own ranges of all node peers are final, called once in the node phase
  */
-template<class Exec, class Q, class UpsweepNodes, class StoreNodePeer, class ScatterNodePeers, class SyncNode>
+template<class Exec, class Q, class UpsweepNodes, class LoadNodePeer, class ScatterNodePeers, class SyncNode>
 void globalSweep(Exec exec, const SweepLists& lists, std::span<const TreeNodeIndex> sendIdx,
                  std::span<const TreeNodeIndex> recvIdx, std::span<Q> globQ, std::span<Q> sendBuf, std::span<Q> recvBuf,
-                 UpsweepNodes&& upsweepNodes, int directMask, StoreNodePeer&& storeNodePeer,
+                 UpsweepNodes&& upsweepNodes, int directMask, LoadNodePeer&& loadNodePeer,
                  ScatterNodePeers&& scatterNodePeers, SyncNode&& syncNode, int tag, MPI_Comm comm)
 {
     int numRounds = int(lists.sendOffsets.size()) - 1;
@@ -471,9 +488,6 @@ void globalSweep(Exec exec, const SweepLists& lists, std::span<const TreeNodeInd
         }
     }
 
-    // the own leaves are set, node peers may start storing
-    if (directMask != 0) { syncNode(); }
-
     for (int round = 0; round < numRounds; ++round)
     {
         // the messages of a round are contiguous, so one gather and one scatter per round
@@ -484,10 +498,14 @@ void globalSweep(Exec exec, const SweepLists& lists, std::span<const TreeNodeInd
         TreeNodeIndex sendFirst = lists.sendOffsets[round], sendLast = lists.sendOffsets[round + 1];
         if (direct && !pool)
         {
-            for (TreeNodeIndex m = sendFirst; m < sendLast; ++m)
+            // peers only read nodes of their own ranges and local upsweep nodes, final after the sync, and later
+            // scatters write outside the node block
+            // the next step starts only after the last sync of this one, which every peer passes after its pull
+            syncNode();
+            for (TreeNodeIndex m = lists.recvOffsets[round]; m < lists.recvOffsets[round + 1]; ++m)
             {
-                storeNodePeer(lists.sendPeers[m],
-                              sendIdx.subspan(lists.sendDispl[m], lists.sendDispl[m + 1] - lists.sendDispl[m]));
+                loadNodePeer(lists.recvPeers[m],
+                             recvIdx.subspan(lists.recvDispl[m], lists.recvDispl[m + 1] - lists.recvDispl[m]));
             }
         }
         else if (!direct && sendFirst != sendLast)
@@ -516,13 +534,13 @@ void globalSweep(Exec exec, const SweepLists& lists, std::span<const TreeNodeInd
             }
         }
 
-        // all node peers have stored this phase and read the earlier values, the pool phase syncs for this phase
+        // the pool phase syncs, so all node peers have finished the network phase and read the earlier values
         // bundles of different partner nodes hold disjoint nodes and none lies in the known block of the own node,
         // which the node peers read in the network phase, so the scatter needs no sync before the pool phase
         // the sync runs inside the parent computation
         std::span nodes(lists.computeIdx.data() + lists.computeOffsets[round],
                         lists.computeIdx.data() + lists.computeOffsets[round + 1]);
-        upsweepNodes(nodes, globQ.data(), directMask != 0 && !toPeers);
+        upsweepNodes(nodes, globQ.data(), pool);
     }
 
     // the last scatter must finish before the next sweep receives into recvBuf

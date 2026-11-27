@@ -29,11 +29,11 @@ __global__ void sumParents(TreeNodeIndex first, TreeNodeIndex last, const TreeNo
 // one block per node and one thread per component of Q
 constexpr int numComponents = Q{}.size();
 
-//! @brief node nodes[i] of peerQ = node nodes[i] of globQ
-__global__ void storeNodePeerKernel(const TreeNodeIndex* nodes, Q* peerQ, const Q* globQ)
+//! @brief node nodes[i] of globQ = node nodes[i] of peerQ
+__global__ void loadNodePeerKernel(const TreeNodeIndex* nodes, const Q* peerQ, Q* globQ)
 {
     TreeNodeIndex n                                   = nodes[blockIdx.x];
-    reinterpret_cast<double*>(peerQ + n)[threadIdx.x] = reinterpret_cast<const double*>(globQ + n)[threadIdx.x];
+    reinterpret_cast<double*>(globQ + n)[threadIdx.x] = reinterpret_cast<const double*>(peerQ + n)[threadIdx.x];
 }
 
 //! @brief node nodes[i] of every peerQ[m] = values[i]
@@ -190,14 +190,14 @@ int main(int argc, char** argv)
                                                                              numNodePeers);
             checkGpuErrors(cudaGetLastError());
         };
-        auto storeNodePeer = [&](int peer, std::span<const TreeNodeIndex> nodes)
+        auto loadNodePeer = [&](int peer, std::span<const TreeNodeIndex> nodes)
         {
-            storeNodePeerKernel<<<nodes.size(), numComponents, 0, exec>>>(nodes.data(), peerQ[peer], globQ);
+            loadNodePeerKernel<<<nodes.size(), numComponents, 0, exec>>>(nodes.data(), peerQ[peer], globQ);
             checkGpuErrors(cudaGetLastError());
         };
         int steps = argc > 1 ? std::atoi(argv[1]) : 10;
         status = testGlobalExchange<DeviceVector>(exec, upsweepFunction, upsweepNodes, allocGlobQ,
-                                                  nodeMask(rank, nodeComm), storeNodePeer, scatterNodePeers, syncNode,
+                                                  nodeMask(rank, nodeComm), loadNodePeer, scatterNodePeers, syncNode,
                                                   rank, numRanks, nodeComm, steps);
     }
     checkGpuErrors(cudaFree(nodePeerQ));

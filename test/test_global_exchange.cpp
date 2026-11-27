@@ -39,11 +39,11 @@ int main(int argc, char** argv)
         globQ.assign(numNodes, Q{});
         return globQ.data();
     };
-    auto storeNodePeer    = [](int, std::span<const TreeNodeIndex>) {};
+    auto loadNodePeer     = [](int, std::span<const TreeNodeIndex>) {};
     auto scatterNodePeers = [](std::span<const TreeNodeIndex>, const Q*) {};
     auto syncNode         = [] {};
     int  status =
-        testGlobalExchange<std::vector>(execution::cpu, upsweepFunction, upsweepNodes, allocGlobQ, 0, storeNodePeer,
+        testGlobalExchange<std::vector>(execution::cpu, upsweepFunction, upsweepNodes, allocGlobQ, 0, loadNodePeer,
                                         scatterNodePeers, syncNode, rank, numRanks, nodeComm, steps, extraLevels);
     MPI_Comm_free(&nodeComm);
     MPI_Finalize();
