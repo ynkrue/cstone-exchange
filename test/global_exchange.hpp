@@ -82,19 +82,16 @@ void populate(int step, std::span<T> leafQ)
 
 /*! @brief run the sweep test
  *
- * @param[in] allocGlobQ     allocGlobQ(numNodes) returns the zeroed node values of this rank in the execution space
- * @param[in] directMask     rank bits of the node peers reachable by direct stores, 0 for none
- * @param[in] loadNodePeer   loadNodePeer(peer, nodes) writes globQ[n] of peer into globQ[n] of this rank
- * @param[in] scatterNodePeers  scatterNodePeers(nodes, values) writes values[i] into globQ[nodes[i]] of all node peers
- * @param[in] syncNode       returns when all node peers have finished the phase they have in common
- * @param[in] steps          number of timed steps
+ * @param[in] allocGlobQ   allocGlobQ(numNodes) returns the zeroed node values of this rank in the execution space
+ * @param[in] extraLevels  uniform tree levels below the deepest level of the spanning tree, 0 for the spanning tree
+ *
+ * directMask, loadNodePeer, scatterNodePeers and syncNode go to globalSweep.
  */
 template<template<class...> class Vector, class Exec, class UpsweepFunction, class UpsweepNodes, class AllocQ,
          class LoadNodePeer, class ScatterNodePeers, class SyncNode>
-int testGlobalExchange(Exec exec, UpsweepFunction upsweepFunction, UpsweepNodes upsweepNodes, AllocQ allocGlobQ,
-                       int directMask, LoadNodePeer loadNodePeer, ScatterNodePeers scatterNodePeers,
-                       SyncNode syncNode, int rank, int numRanks, MPI_Comm nodeComm, int steps,
-                       int extraLevels = 0)
+int testGlobalExchange(Exec exec, UpsweepFunction upsweepFunction, UpsweepNodes upsweepNodes, int rank, int numRanks,
+                       int steps, MPI_Comm nodeComm, AllocQ allocGlobQ, int directMask, LoadNodePeer loadNodePeer,
+                       ScatterNodePeers scatterNodePeers, SyncNode syncNode, int extraLevels = 0)
 {
     using KeyType = unsigned;
 
@@ -221,10 +218,10 @@ int testGlobalExchange(Exec exec, UpsweepFunction upsweepFunction, UpsweepNodes 
         scatter(exec, gOctree.leafToInternalSpan().subspan(firstLeaf, numLeaves), localQ.data(), globQ);
         globalSweep(
             exec, lists, {sendIdx.data(), sendIdx.size()}, {recvIdx.data(), recvIdx.size()},
-            std::span<Q>(globQ, hostTree.numNodes), {sendBuf.data(), sendBuf.size()}, {recvBuf.data(), recvBuf.size()},
-            [&](std::span<const TreeNodeIndex> nodes, Q* q, bool syncFirst)
-            { upsweepNodes(nodes, gOctree.childOffsets, q, syncFirst); },
-            directMask, loadNodePeer, scatterNodePeers, syncNode, tag, MPI_COMM_WORLD);
+            std::span<Q>(globQ, hostTree.numNodes), {sendBuf.data(), sendBuf.size()},
+            {recvBuf.data(), recvBuf.size()}, [&](std::span<const TreeNodeIndex> nodes, Q* q, bool syncFirst)
+            { upsweepNodes(nodes, gOctree.childOffsets, q, syncFirst); }, directMask, loadNodePeer, scatterNodePeers,
+            syncNode, tag, MPI_COMM_WORLD);
         p2pTime[step] = MPI_Wtime() - start;
 
         // check the far nodes and own leaves of this rank from the p2p sweep

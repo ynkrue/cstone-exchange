@@ -42,9 +42,9 @@ int main(int argc, char** argv)
     auto loadNodePeer     = [](int, std::span<const TreeNodeIndex>) {};
     auto scatterNodePeers = [](std::span<const TreeNodeIndex>, const Q*) {};
     auto syncNode         = [] {};
-    int  status =
-        testGlobalExchange<std::vector>(execution::cpu, upsweepFunction, upsweepNodes, allocGlobQ, 0, loadNodePeer,
-                                        scatterNodePeers, syncNode, rank, numRanks, nodeComm, steps, extraLevels);
+    int  status = testGlobalExchange<std::vector>(execution::cpu, upsweepFunction, upsweepNodes, rank, numRanks, steps,
+                                                  nodeComm, allocGlobQ, 0, loadNodePeer, scatterNodePeers, syncNode,
+                                                  extraLevels);
     MPI_Comm_free(&nodeComm);
     MPI_Finalize();
     return status;

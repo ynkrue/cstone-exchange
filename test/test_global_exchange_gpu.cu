@@ -196,9 +196,9 @@ int main(int argc, char** argv)
             checkGpuErrors(cudaGetLastError());
         };
         int steps = argc > 1 ? std::atoi(argv[1]) : 10;
-        status = testGlobalExchange<DeviceVector>(exec, upsweepFunction, upsweepNodes, allocGlobQ,
-                                                  nodeMask(rank, nodeComm), loadNodePeer, scatterNodePeers, syncNode,
-                                                  rank, numRanks, nodeComm, steps);
+        status = testGlobalExchange<DeviceVector>(exec, upsweepFunction, upsweepNodes, rank, numRanks, steps,
+                                                  nodeComm, allocGlobQ, nodeMask(rank, nodeComm), loadNodePeer,
+                                                  scatterNodePeers, syncNode);
     }
     checkGpuErrors(cudaFree(nodePeerQ));
     nvshmem_free(globQ);
