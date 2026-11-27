@@ -176,10 +176,10 @@ int main(int argc, char** argv)
             syncNodeKernel<<<1, numNodePeers, 0, exec>>>(nodeSignal, nodePeerPes.data(), myPos, ++numSyncs);
             checkGpuErrors(cudaGetLastError());
         };
-        int maxPartners = argc > 1 ? std::atoi(argv[1]) : 8;
+        int steps = argc > 1 ? std::atoi(argv[1]) : 10;
         status = testGlobalExchange<DeviceVector>(exec, upsweepFunction, upsweepNodes, allocGlobQ,
                                                   nodeMask(rank, nodeComm), storeNodePeer, scatterNodePeers, syncNode,
-                                                  rank, numRanks, nodeComm, maxPartners);
+                                                  rank, numRanks, nodeComm, steps);
     }
     checkGpuErrors(cudaFree(nodePeerQ));
     nvshmem_free(globQ);

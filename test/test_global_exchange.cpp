@@ -30,7 +30,7 @@ int main(int argc, char** argv)
     };
     int      ranksPerNode = argc > 1 ? std::atoi(argv[1]) : 1;
     int      extraLevels  = argc > 2 ? std::atoi(argv[2]) : 0;
-    int      maxPartners  = argc > 3 ? std::atoi(argv[3]) : 8;
+    int      steps        = argc > 3 ? std::atoi(argv[3]) : 10;
     MPI_Comm nodeComm;
     MPI_Comm_split(MPI_COMM_WORLD, rank / ranksPerNode, rank, &nodeComm);
     std::vector<Q> globQ;
@@ -44,7 +44,7 @@ int main(int argc, char** argv)
     auto syncNode         = [] {};
     int  status =
         testGlobalExchange<std::vector>(execution::cpu, upsweepFunction, upsweepNodes, allocGlobQ, 0, storeNodePeer,
-                                        scatterNodePeers, syncNode, rank, numRanks, nodeComm, maxPartners, extraLevels);
+                                        scatterNodePeers, syncNode, rank, numRanks, nodeComm, steps, extraLevels);
     MPI_Comm_free(&nodeComm);
     MPI_Finalize();
     return status;

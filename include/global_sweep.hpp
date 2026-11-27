@@ -124,12 +124,12 @@ inline std::vector<int> levelMasks(int numRanks, int leavesPerRank)
 /*! @brief cumulative rank bits known after each round for units of ranks that exchange first
  *
  * The first mask is unitMask. The other rank bits follow lowest first in as few rounds as the radix allows, with
- * group sizes as equal as possible, larger groups first. A rank talks to maxPartners partners per round and unit
- * rank at most, 8 is the default of the model (see .claude/docs/model.md Proposition 3).
+ * group sizes as equal as possible, larger groups first. A rank talks to 8 partners per round and unit rank at
+ * most, which meets the round bound at P 4096 with 4 ranks per node (see .claude/docs/model.md Proposition 3).
  */
-inline std::vector<int> roundMasks(int numRanks, int unitMask, int maxPartners)
+inline std::vector<int> roundMasks(int numRanks, int unitMask)
 {
-    int maxBits = std::bit_width(unsigned(maxPartners * (1 << std::popcount(unsigned(unitMask))) + 1)) - 1;
+    int maxBits = 3 + std::popcount(unsigned(unitMask));
     int rest    = (numRanks - 1) & ~unitMask;
     int q       = std::popcount(unsigned(rest));
     int R       = (q + maxBits - 1) / maxBits;

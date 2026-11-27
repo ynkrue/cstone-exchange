@@ -66,16 +66,16 @@ OctreeData<KeyType, Exec> uploadOctree(const OctreeData<KeyType, execution::Cpu>
     return acc;
 }
 
-//! @brief leaf values of repetition @p rep, different in every repetition so stale values fail the check
+//! @brief leaf values of step @p step, different in every step so stale values fail the check
 template<class T>
-void populate(int rep, std::span<T> leafQ)
+void populate(int step, std::span<T> leafQ)
 {
     for (std::size_t i = 0; i < leafQ.size(); ++i)
     {
         // small integers, so that sums over the tree are exact; components differ by the factor k + 1
         for (std::size_t k = 0; k < leafQ[i].size(); ++k)
         {
-            leafQ[i][k] = double((i + rep + 1) * (k + 1));
+            leafQ[i][k] = double((i + step + 1) * (k + 1));
         }
     }
 }
@@ -87,17 +87,16 @@ void populate(int rep, std::span<T> leafQ)
  * @param[in] storeNodePeer  storeNodePeer(peer, nodes) writes globQ[n] of this rank into globQ[n] of peer
  * @param[in] scatterNodePeers  scatterNodePeers(nodes, values) writes values[i] into globQ[nodes[i]] of all node peers
  * @param[in] syncNode       returns when all node peers have finished their stores of the phase
- * @param[in] maxPartners    most partners per rank and round, per unit rank
+ * @param[in] steps          number of timed steps
  */
 template<template<class...> class Vector, class Exec, class UpsweepFunction, class UpsweepNodes, class AllocQ,
          class StoreNodePeer, class ScatterNodePeers, class SyncNode>
 int testGlobalExchange(Exec exec, UpsweepFunction upsweepFunction, UpsweepNodes upsweepNodes, AllocQ allocGlobQ,
                        int directMask, StoreNodePeer storeNodePeer, ScatterNodePeers scatterNodePeers,
-                       SyncNode syncNode, int rank, int numRanks, MPI_Comm nodeComm, int maxPartners,
+                       SyncNode syncNode, int rank, int numRanks, MPI_Comm nodeComm, int steps,
                        int extraLevels = 0)
 {
-    using KeyType      = unsigned;
-    constexpr int reps = 10;
+    using KeyType = unsigned;
 
     ///! global tree
     std::vector<KeyType> boundaries(numRanks + 1);
@@ -165,7 +164,7 @@ int testGlobalExchange(Exec exec, UpsweepFunction upsweepFunction, UpsweepNodes 
     double start    = MPI_Wtime();
     int    unitMask = nodeMask(rank, nodeComm);
     auto   masks =
-        unitMask ? roundMasks(numRanks, unitMask, maxPartners) : levelMasks(numRanks, hostTree.numLeafNodes / numRanks);
+        unitMask ? roundMasks(numRanks, unitMask) : levelMasks(numRanks, hostTree.numLeafNodes / numRanks);
     auto   lists     = createSweepLists<KeyType>(hostTree, assignment, masks, invThetaEff, tol, box, rank);
     double setupTime = MPI_Wtime() - start;
 
@@ -188,13 +187,13 @@ int testGlobalExchange(Exec exec, UpsweepFunction upsweepFunction, UpsweepNodes 
     };
 
     std::vector<Q>      leafQ(hostTree.numLeafNodes), reference(hostTree.numNodes), sweptQ(hostTree.numNodes);
-    std::vector<double> allgatherTime(reps);
-    std::vector<double> p2pTime(reps);
+    std::vector<double> allgatherTime(steps);
+    std::vector<double> p2pTime(steps);
     int                 allgatherErrors = 0;
     int                 p2pErrors       = 0;
-    for (int rep = 0; rep < reps; ++rep)
+    for (int step = 0; step < steps; ++step)
     {
-        populate(rep, std::span<Q>(leafQ));
+        populate(step, std::span<Q>(leafQ));
         cstone::scatter(hostTree.leafToInternalSpan(), leafQ.data(), reference.data());
         cstone::upsweep(hostTree.levelRangeSpan(), hostTree.childOffsets, reference.data(), CombineSum{});
         Vector<Q> localQ(leafQ.data() + firstLeaf, leafQ.data() + firstLeaf + numLeaves);
@@ -207,7 +206,7 @@ int testGlobalExchange(Exec exec, UpsweepFunction upsweepFunction, UpsweepNodes 
         scatter(exec, gOctree.leafToInternalSpan(), allLeaves.data(), allQ.data());
         upsweepFunction(gOctree.levelRangeSpan(), gOctree.childOffsets, allQ.data());
         if constexpr (execution::HaveGpu<Exec>{}) { syncGpu(exec); }
-        allgatherTime[rep] = MPI_Wtime() - start;
+        allgatherTime[step] = MPI_Wtime() - start;
 
         // check all nodes from Allgather
         auto fullQ = download(allQ);
@@ -225,7 +224,7 @@ int testGlobalExchange(Exec exec, UpsweepFunction upsweepFunction, UpsweepNodes 
             std::span<Q>(globQ, hostTree.numNodes), {sendBuf.data(), sendBuf.size()}, {recvBuf.data(), recvBuf.size()},
             [&](std::span<const TreeNodeIndex> nodes, Q* q) { upsweepNodes(nodes, gOctree.childOffsets, q); },
             directMask, storeNodePeer, scatterNodePeers, syncNode, tag, MPI_COMM_WORLD);
-        p2pTime[rep] = MPI_Wtime() - start;
+        p2pTime[step] = MPI_Wtime() - start;
 
         // check the far nodes and own leaves of this rank from the p2p sweep
         if constexpr (execution::HaveGpu<Exec>{})
@@ -269,18 +268,18 @@ int testGlobalExchange(Exec exec, UpsweepFunction upsweepFunction, UpsweepNodes 
     }
     MPI_Reduce(netCounts, maxNet, 2, MPI_LONG, MPI_MAX, 0, MPI_COMM_WORLD);
     MPI_Reduce(netCounts, sumNet, 2, MPI_LONG, MPI_SUM, 0, MPI_COMM_WORLD);
-    std::vector<double> gatheredTimes(std::size_t(numRanks) * reps), gatheredP2pTimes(std::size_t(numRanks) * reps);
-    MPI_Allgather(allgatherTime.data(), reps, MPI_DOUBLE, gatheredTimes.data(), reps, MPI_DOUBLE, MPI_COMM_WORLD);
-    MPI_Allgather(p2pTime.data(), reps, MPI_DOUBLE, gatheredP2pTimes.data(), reps, MPI_DOUBLE, MPI_COMM_WORLD);
+    std::vector<double> gatheredTimes(std::size_t(numRanks) * steps), gatheredP2pTimes(std::size_t(numRanks) * steps);
+    MPI_Allgather(allgatherTime.data(), steps, MPI_DOUBLE, gatheredTimes.data(), steps, MPI_DOUBLE, MPI_COMM_WORLD);
+    MPI_Allgather(p2pTime.data(), steps, MPI_DOUBLE, gatheredP2pTimes.data(), steps, MPI_DOUBLE, MPI_COMM_WORLD);
 
-    // max, mean and median over ranks of repetition rep
-    auto rankStats = [&](const std::vector<double>& gathered, int rep, double& max, double& mean, double& median)
+    // max, mean and median over ranks for one step
+    auto rankStats = [&](const std::vector<double>& gathered, int step, double& max, double& mean, double& median)
     {
         std::vector<double> rankTimes(numRanks);
         mean = 0;
         for (int r = 0; r < numRanks; ++r)
         {
-            rankTimes[r] = gathered[std::size_t(r) * reps + rep];
+            rankTimes[r] = gathered[std::size_t(r) * steps + step];
             mean += rankTimes[r];
         }
         mean /= numRanks;
@@ -299,20 +298,19 @@ int testGlobalExchange(Exec exec, UpsweepFunction upsweepFunction, UpsweepNodes 
             std::printf(t ? " %x" : "%x", masks[t]);
         }
         std::printf("\n");
-        std::printf("max partners per rank and round: %d\n", maxPartners);
         std::printf("p2p setup [ms]: %.3f\n", setupTime * 1e3);
         std::printf("far nodes, send msgs, recv msgs (max / mean): %ld / %.1f, %ld / %.1f, %ld / %.1f\n", maxCounts[0],
                     double(sumCounts[0]) / numRanks, maxCounts[1], double(sumCounts[1]) / numRanks, maxCounts[2],
                     double(sumCounts[2]) / numRanks);
         std::printf("network send msgs, values (max / mean): %ld / %.1f, %ld / %.1f\n", maxNet[0],
                     double(sumNet[0]) / numRanks, maxNet[1], double(sumNet[1]) / numRanks);
-        std::printf("rep | allgather max [ms] | mean [ms] | median [ms] | p2p max [ms] | mean [ms] | median [ms]\n");
-        for (int rep = 0; rep < reps; ++rep)
+        std::printf("step | allgather max [ms] | mean [ms] | median [ms] | p2p max [ms] | mean [ms] | median [ms]\n");
+        for (int step = 0; step < steps; ++step)
         {
             double max, mean, median, p2pMax, p2pMean, p2pMedian;
-            rankStats(gatheredTimes, rep, max, mean, median);
-            rankStats(gatheredP2pTimes, rep, p2pMax, p2pMean, p2pMedian);
-            std::printf("%3d | %18.3f | %9.3f | %11.3f | %12.3f | %9.3f | %11.3f\n", rep + 1, max * 1e3, mean * 1e3,
+            rankStats(gatheredTimes, step, max, mean, median);
+            rankStats(gatheredP2pTimes, step, p2pMax, p2pMean, p2pMedian);
+            std::printf("%4d | %18.3f | %9.3f | %11.3f | %12.3f | %9.3f | %11.3f\n", step + 1, max * 1e3, mean * 1e3,
                         median * 1e3, p2pMax * 1e3, p2pMean * 1e3, p2pMedian * 1e3);
         }
         std::printf("allgather upsweep: %s (%d errors)\n", allgatherErrors ? "FAIL" : "PASS", allgatherErrors);
