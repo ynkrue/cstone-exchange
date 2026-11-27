@@ -222,7 +222,8 @@ int testGlobalExchange(Exec exec, UpsweepFunction upsweepFunction, UpsweepNodes 
         globalSweep(
             exec, lists, {sendIdx.data(), sendIdx.size()}, {recvIdx.data(), recvIdx.size()},
             std::span<Q>(globQ, hostTree.numNodes), {sendBuf.data(), sendBuf.size()}, {recvBuf.data(), recvBuf.size()},
-            [&](std::span<const TreeNodeIndex> nodes, Q* q) { upsweepNodes(nodes, gOctree.childOffsets, q); },
+            [&](std::span<const TreeNodeIndex> nodes, Q* q, bool syncFirst)
+            { upsweepNodes(nodes, gOctree.childOffsets, q, syncFirst); },
             directMask, storeNodePeer, scatterNodePeers, syncNode, tag, MPI_COMM_WORLD);
         p2pTime[step] = MPI_Wtime() - start;
 

@@ -55,8 +55,22 @@ struct NodeList
 };
 
 //! @brief one block computes the parents of the list in order, thread c sums component c of the children
-__global__ void sumParentsList(NodeList list, const TreeNodeIndex* children, Q* q)
+__global__ void sumParentsList(NodeList list, const TreeNodeIndex* children, Q* q, uint64_t* signal,
+                               const int* peerPes, int myPos, int numPeers, uint64_t count)
 {
+    // count is 0 without sync, numComponents threads cover all node peers
+    if (count != 0)
+    {
+        int m = threadIdx.x;
+        if (m < numPeers && m != myPos)
+        {
+            __threadfence_system();
+            nvshmemx_signal_op(signal + myPos, count, NVSHMEM_SIGNAL_SET, peerPes[m]);
+            nvshmem_signal_wait_until(signal + m, NVSHMEM_CMP_GE, count);
+        }
+        __threadfence();
+        __syncthreads();
+    }
     for (int i = 0; i < list.count; ++i)
     {
         TreeNodeIndex n = list.nodes[i];
@@ -133,14 +147,24 @@ int main(int argc, char** argv)
                 }
             }
         };
-        auto upsweepNodes = [&](std::span<const TreeNodeIndex> nodes, const TreeNodeIndex* children, Q* q)
+        auto syncNode = [&]
         {
+            syncNodeKernel<<<1, numNodePeers, 0, exec>>>(nodeSignal, nodePeerPes.data(), myPos, ++numSyncs);
+            checkGpuErrors(cudaGetLastError());
+        };
+        // the sync of a phase runs inside the first parent kernel
+        auto upsweepNodes = [&](std::span<const TreeNodeIndex> nodes, const TreeNodeIndex* children, Q* q,
+                                bool syncFirst)
+        {
+            if (syncFirst && nodes.empty()) { syncNode(); }
             for (std::size_t first = 0; first < nodes.size(); first += maxListNodes)
             {
                 NodeList list;
                 list.count = int(std::min<std::size_t>(maxListNodes, nodes.size() - first));
                 std::copy_n(nodes.begin() + first, list.count, list.nodes);
-                sumParentsList<<<1, numComponents, 0, exec>>>(list, children, q);
+                uint64_t count = (first == 0 && syncFirst) ? ++numSyncs : 0;
+                sumParentsList<<<1, numComponents, 0, exec>>>(list, children, q, nodeSignal, nodePeerPes.data(),
+                                                              myPos, numNodePeers, count);
                 checkGpuErrors(cudaGetLastError());
             }
         };
@@ -169,11 +193,6 @@ int main(int argc, char** argv)
         auto storeNodePeer = [&](int peer, std::span<const TreeNodeIndex> nodes)
         {
             storeNodePeerKernel<<<nodes.size(), numComponents, 0, exec>>>(nodes.data(), peerQ[peer], globQ);
-            checkGpuErrors(cudaGetLastError());
-        };
-        auto syncNode = [&]
-        {
-            syncNodeKernel<<<1, numNodePeers, 0, exec>>>(nodeSignal, nodePeerPes.data(), myPos, ++numSyncs);
             checkGpuErrors(cudaGetLastError());
         };
         int steps = argc > 1 ? std::atoi(argv[1]) : 10;

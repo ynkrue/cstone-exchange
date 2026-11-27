@@ -21,7 +21,7 @@ int main(int argc, char** argv)
     MPI_Comm_size(MPI_COMM_WORLD, &numRanks);
     auto upsweepFunction = [](std::span<const TreeNodeIndex> ranges, const TreeNodeIndex* children, Q* q)
     { cstone::upsweep(ranges, children, q, CombineSum{}); };
-    auto upsweepNodes = [](std::span<const TreeNodeIndex> nodes, const TreeNodeIndex* children, Q* q)
+    auto upsweepNodes = [](std::span<const TreeNodeIndex> nodes, const TreeNodeIndex* children, Q* q, bool)
     {
         for (TreeNodeIndex n : nodes)
         {

@@ -434,12 +434,14 @@ SweepLists createSweepLists(OctreeView<const KeyType> tree, const SfcAssignment<
  * direct stores the pool phases send nothing, the network phase scatters its received nodes into all node peers.
  *
  * @param[inout] globQ           values of all global nodes, own leaves set by the caller
- * @param[in]    upsweepNodes    upsweepNodes(nodes, globQ) sets nodes from their children
+ * @param[in]    upsweepNodes    upsweepNodes(nodes, globQ, syncFirst) sets nodes from their children, if syncFirst
+ *                               it first waits until all node peers have finished their stores of the phase, also
+ *                               for empty nodes
  * @param[in]    directMask      rank bits of the node peers reachable by direct stores, 0 for none
  * @param[in]    storeNodePeer   storeNodePeer(peer, nodes) writes globQ[n] of this rank into globQ[n] of peer
  * @param[in]    scatterNodePeers  scatterNodePeers(nodes, values) writes values[i] into globQ[nodes[i]] of all node
  *                                 peers and this rank, only called if directMask is not 0
- * @param[in]    syncNode        returns when all node peers have finished their stores of the phase
+ * @param[in]    syncNode        returns when the own leaves of all node peers are set, only called at the start
  */
 template<class Exec, class Q, class UpsweepNodes, class StoreNodePeer, class ScatterNodePeers, class SyncNode>
 void globalSweep(Exec exec, const SweepLists& lists, std::span<const TreeNodeIndex> sendIdx,
@@ -517,11 +519,10 @@ void globalSweep(Exec exec, const SweepLists& lists, std::span<const TreeNodeInd
         // all node peers have stored this phase and read the earlier values, the pool phase syncs for this phase
         // bundles of different partner nodes hold disjoint nodes and none lies in the known block of the own node,
         // which the node peers read in the network phase, so the scatter needs no sync before the pool phase
-        if (directMask != 0 && !toPeers) { syncNode(); }
-
+        // the sync runs inside the parent computation
         std::span nodes(lists.computeIdx.data() + lists.computeOffsets[round],
                         lists.computeIdx.data() + lists.computeOffsets[round + 1]);
-        upsweepNodes(nodes, globQ.data());
+        upsweepNodes(nodes, globQ.data(), directMask != 0 && !toPeers);
     }
 
     // the last scatter must finish before the next sweep receives into recvBuf
