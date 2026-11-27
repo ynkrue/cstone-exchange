@@ -1,5 +1,5 @@
 #!/bin/bash
-#SBATCH --job-name=cc-relay-gpu
+#SBATCH --job-name=relay-gpu
 #SBATCH --account=csstaff
 #SBATCH --partition=normal
 #SBATCH --time=00:15:00
@@ -8,7 +8,7 @@
 #SBATCH --exclusive
 #SBATCH --uenv=prgenv-gnu/26.9:3103280092
 #SBATCH --view=default
-#SBATCH --output=/users/yrfenach/cstone-exchange/.claude/scratch/logs-archive/%x-%j.out
+#SBATCH --output=/users/yrfenach/cstone-exchange/logs/%x-%j.out
 
 # GPU test on 4, 8, ... nodes up to the allocation (P 16 up), 4 ranks per node with one GPU each
 export MPICH_GPU_IPC_THRESHOLD=1

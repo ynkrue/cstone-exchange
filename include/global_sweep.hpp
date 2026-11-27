@@ -104,7 +104,7 @@ bool needs(KeyType prefix, bool isLeaf, std::span<const IBox> targets, float inv
 
 /*! @brief cumulative rank bits known after each round of the level schedule, 3 bits per tree level
  *
- * The first mask is 0, so round 0 has no messages. 3 bits per round (radix 8) is the time optimum of the rank
+ * The first mask is 0, so the node block is empty. 3 bits per round (radix 8) is the time optimum of the rank
  * relay in the LogGP model and coincides with one tree level per round (see .claude/docs/model.md Proposition 2).
  * The first group has the bits that complete the tree level above the nodes of a rank, 3 - log2(leavesPerRank) mod 3,
  * and 3 if that is 0. The last group is truncated. Requires numRanks and leavesPerRank to be powers of two.
@@ -129,16 +129,16 @@ inline std::vector<int> levelMasks(int numRanks, int leavesPerRank)
  */
 inline std::vector<int> roundMasks(int numRanks, int unitMask)
 {
-    int maxBits = 3 + std::popcount(unsigned(unitMask));
-    int rest    = (numRanks - 1) & ~unitMask;
-    int q       = std::popcount(unsigned(rest));
-    int R       = (q + maxBits - 1) / maxBits;
+    int maxBits   = 3 + std::popcount(unsigned(unitMask));
+    int rest      = (numRanks - 1) & ~unitMask;
+    int numBits   = std::popcount(unsigned(rest));
+    int numRounds = (numBits + maxBits - 1) / maxBits;
 
     std::vector<int> masks{unitMask};
-    for (int g = 0; g < R; ++g)
+    for (int g = 0; g < numRounds; ++g)
     {
         int mask = masks.back();
-        for (int b = 0; b < q / R + (g < q % R ? 1 : 0); ++b)
+        for (int b = 0; b < numBits / numRounds + (g < numBits % numRounds ? 1 : 0); ++b)
         {
             mask |= rest & -rest;
             rest &= rest - 1;
@@ -157,18 +157,18 @@ inline int nodeMask(int rank, MPI_Comm nodeComm)
     int size;
     MPI_Comm_size(nodeComm, &size);
     std::vector<int> ranks(size);
-    MPI_Allgather(&rank, 1, MPI_INT, ranks.data(), 1, MPI_INT, nodeComm);
+    mpiAllgather(&rank, ranks.data(), 1, nodeComm);
 
     int mask = 0;
     for (int r : ranks)
     {
         mask |= r ^ rank;
     }
-    std::sort(ranks.begin(), ranks.end());
-    bool ok =
-        size == (1 << std::popcount(unsigned(mask))) && std::adjacent_find(ranks.begin(), ranks.end()) == ranks.end();
-    ok = ok && std::all_of(ranks.begin(), ranks.end(), [&](int r) { return (r & ~mask) == (rank & ~mask); });
-    if (!ok) { throw std::runtime_error("ranks of the node are not a subset block of the SFC ranks"); }
+    // the ranks are distinct and agree with rank outside the mask, so they are the whole block if the size matches
+    if (size != 1 << std::popcount(unsigned(mask)))
+    {
+        throw std::runtime_error("ranks of the node are not a subset block of the SFC ranks");
+    }
     return mask;
 }
 
@@ -368,6 +368,7 @@ SweepLists createSweepLists(OctreeView<const KeyType> tree, const SfcAssignment<
         unitSub = (unitSub - unitMask) & unitMask;
     } while (unitSub != 0);
     int numNodePeers = int(nodePeers.size());
+    int myPos        = int(std::find(nodePeers.begin(), nodePeers.end(), myRank) - nodePeers.begin());
 
     for (int t = 1; t < int(masks.size()); ++t)
     {
@@ -378,49 +379,42 @@ SweepLists createSweepLists(OctreeView<const KeyType> tree, const SfcAssignment<
 
         auto myReceivers = receiverBoxes(assignment, myRank, recvMask);
 
-        // calls f(j) for the partner offsets j of handler, the k-th offset goes to node peer k % numNodePeers
-        auto forHandled = [&](int handler, auto&& f)
+        // partner offsets of the round, node peer p handles the offsets p, p + numNodePeers, ...
+        std::vector<int> offsets;
+        for (unsigned j = fresh & -fresh; j != 0; j = (j - fresh) & fresh)
         {
-            unsigned k = 0;
-            for (unsigned j = fresh & -fresh; j != 0; j = (j - fresh) & fresh)
-            {
-                if (nodePeers[k % numNodePeers] == handler) { f(int(j)); }
-                ++k;
-            }
-        };
+            offsets.push_back(int(j));
+        }
 
         std::vector<TreeNodeIndex> received;
-        forHandled(
-            myRank,
-            [&](int j)
-            {
-                int  peer          = myRank ^ j;
-                auto peerReceivers = receiverBoxes(assignment, peer, recvMask);
-                addSend(peer, messageNodes(tree, assignment, myRank, prevMask, peerReceivers, invThetaEff, tol, box));
-                auto recvNodes = messageNodes(tree, assignment, peer, prevMask, myReceivers, invThetaEff, tol, box);
-                addRecv(peer, recvNodes);
-                received.insert(received.end(), recvNodes.begin(), recvNodes.end());
-            });
+        for (std::size_t k = myPos; k < offsets.size(); k += numNodePeers)
+        {
+            int  peer          = myRank ^ offsets[k];
+            auto peerReceivers = receiverBoxes(assignment, peer, recvMask);
+            addSend(peer, messageNodes(tree, assignment, myRank, prevMask, peerReceivers, invThetaEff, tol, box));
+            auto recvNodes = messageNodes(tree, assignment, peer, prevMask, myReceivers, invThetaEff, tol, box);
+            addRecv(peer, recvNodes);
+            received.insert(received.end(), recvNodes.begin(), recvNodes.end());
+        }
         endPhase();
 
         // the handlers pool the bundles of the node pairs to the other node peers
         std::sort(received.begin(), received.end());
         received.erase(std::unique(received.begin(), received.end()), received.end());
-        for (int nodePeer : nodePeers)
+        for (int p = 0; p < numNodePeers; ++p)
         {
-            if (nodePeer == myRank) { continue; }
+            if (p == myPos) { continue; }
             std::vector<TreeNodeIndex> pooled;
-            forHandled(nodePeer,
-                       [&](int j)
-                       {
-                           auto nodes = messageNodes(tree, assignment, nodePeer ^ j, prevMask, myReceivers,
-                                                     invThetaEff, tol, box);
-                           pooled.insert(pooled.end(), nodes.begin(), nodes.end());
-                       });
+            for (std::size_t k = p; k < offsets.size(); k += numNodePeers)
+            {
+                auto nodes = messageNodes(tree, assignment, nodePeers[p] ^ offsets[k], prevMask, myReceivers,
+                                          invThetaEff, tol, box);
+                pooled.insert(pooled.end(), nodes.begin(), nodes.end());
+            }
             std::sort(pooled.begin(), pooled.end());
             pooled.erase(std::unique(pooled.begin(), pooled.end()), pooled.end());
-            addSend(nodePeer, received);
-            addRecv(nodePeer, pooled);
+            addSend(nodePeers[p], received);
+            addRecv(nodePeers[p], pooled);
         }
         auto parents = computeNodes(tree, assignment, masks, t, myRank, myReceivers, invThetaEff, tol, box);
         lists.computeIdx.insert(lists.computeIdx.end(), parents.begin(), parents.end());
@@ -440,20 +434,20 @@ SweepLists createSweepLists(OctreeView<const KeyType> tree, const SfcAssignment<
  * @param[in]    upsweepNodes      upsweepNodes(nodes, globQ, syncFirst) sets nodes from their children, if syncFirst
  *                                 it first waits until all node peers have finished the scatters of the phase, also
  *                                 for empty nodes
- * @param[in]    directMask        masks[0] of the lists if the node peers are reachable by direct access, else 0
- * @param[in]    loadNodePeer      loadNodePeer(peer, nodes) writes globQ[n] of peer into globQ[n] of this rank
+ * @param[in]    direct            true if the node peers are reachable by direct access
+ * @param[in]    pullNodePeers     pullNodePeers(peers, displ, nodes) waits until the own range of all node peers is
+ *                                 final, then writes globQ[n] of peers[i] into globQ[n] of this rank for n in
+ *                                 nodes[displ[i], displ[i+1])
  * @param[in]    scatterNodePeers  scatterNodePeers(nodes, values) writes values[i] into globQ[nodes[i]] of all node
  *                                 peers and this rank
- * @param[in]    syncNode          returns when the own range of all node peers is final
  */
-template<class Exec, class Q, class UpsweepNodes, class LoadNodePeer, class ScatterNodePeers, class SyncNode>
+template<class Exec, class Q, class UpsweepNodes, class PullNodePeers, class ScatterNodePeers>
 void globalSweep(Exec exec, const SweepLists& lists, std::span<const TreeNodeIndex> sendIdx,
                  std::span<const TreeNodeIndex> recvIdx, std::span<Q> globQ, std::span<Q> sendBuf, std::span<Q> recvBuf,
-                 UpsweepNodes&& upsweepNodes, int directMask, LoadNodePeer&& loadNodePeer,
-                 ScatterNodePeers&& scatterNodePeers, SyncNode&& syncNode, int tag, MPI_Comm comm)
+                 UpsweepNodes&& upsweepNodes, bool direct, PullNodePeers&& pullNodePeers,
+                 ScatterNodePeers&& scatterNodePeers, int tag, MPI_Comm comm)
 {
     int  numPhases = int(lists.sendOffsets.size()) - 1;
-    bool direct    = directMask != 0;
     auto parents   = [&](int phase)
     {
         return std::span(lists.computeIdx.data() + lists.computeOffsets[phase],
@@ -481,12 +475,9 @@ void globalSweep(Exec exec, const SweepLists& lists, std::span<const TreeNodeInd
     {
         // the pulled nodes lie in the ranges of the peers and are final after the sync, later scatters write outside
         // them, and the next step starts after the last sync of this one, so the pull needs no second sync
-        syncNode();
-        for (TreeNodeIndex m = lists.recvOffsets[1]; m < lists.recvOffsets[2]; ++m)
-        {
-            loadNodePeer(lists.recvPeers[m],
-                         recvIdx.subspan(lists.recvDispl[m], lists.recvDispl[m + 1] - lists.recvDispl[m]));
-        }
+        TreeNodeIndex first = lists.recvOffsets[1], last = lists.recvOffsets[2];
+        pullNodePeers(std::span(lists.recvPeers).subspan(first, last - first),
+                      std::span(lists.recvDispl).subspan(first, last - first + 1), recvIdx);
         upsweepNodes(parents(1), globQ.data(), false);
     }
 

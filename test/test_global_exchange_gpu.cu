@@ -37,11 +37,39 @@ __global__ void sumParents(TreeNodeIndex first, const TreeNodeIndex* children, Q
     reinterpret_cast<double*>(q)[std::size_t(i) * numComponents + threadIdx.x] = sum;
 }
 
-//! @brief node nodes[i] of globQ = node nodes[i] of peerQ
-__global__ void loadNodePeerKernel(const TreeNodeIndex* nodes, const Q* peerQ, Q* globQ)
+// messages of the node block, passed by value, src[i] is the globQ of the peer of message i
+constexpr int maxPullMessages = 32;
+struct PullMessages
 {
-    TreeNodeIndex n                                   = nodes[blockIdx.x];
-    reinterpret_cast<double*>(globQ + n)[threadIdx.x] = reinterpret_cast<const double*>(peerQ + n)[threadIdx.x];
+    int           count;
+    TreeNodeIndex displ[maxPullMessages + 1];
+    const Q*      src[maxPullMessages];
+};
+
+/*! @brief syncs with the node peers like syncNodeKernel, then block (x, y) copies nodes[displ[y] + x] of message y
+ *
+ * Every block signals before it waits. CUDA does not guarantee that a given block runs while others spin, and setting
+ * the same count again does not change the slot.
+ */
+__global__ void pullNodePeersKernel(PullMessages msgs, const TreeNodeIndex* nodes, Q* globQ, uint64_t* signal,
+                                    const int* peerPes, int myPos, int numPeers, uint64_t count)
+{
+    int m = threadIdx.x;
+    if (m < numPeers && m != myPos)
+    {
+        __threadfence_system();
+        nvshmemx_signal_op(signal + myPos, count, NVSHMEM_SIGNAL_SET, peerPes[m]);
+        nvshmem_signal_wait_until(signal + m, NVSHMEM_CMP_GE, count);
+    }
+    __threadfence();
+    __syncthreads();
+
+    int y = blockIdx.y;
+    if (y < msgs.count && msgs.displ[y] + int(blockIdx.x) < msgs.displ[y + 1])
+    {
+        TreeNodeIndex n = nodes[msgs.displ[y] + blockIdx.x];
+        globQ[n][threadIdx.x] = msgs.src[y][n][threadIdx.x];
+    }
 }
 
 //! @brief node nodes[i] of every peerQ[m] = values[i]
@@ -79,19 +107,17 @@ __global__ void sumParentsList(NodeList list, const TreeNodeIndex* children, Q* 
         __threadfence();
         __syncthreads();
     }
+    // the list holds internal nodes only
+    double* qd = reinterpret_cast<double*>(q);
     for (int i = 0; i < list.count; ++i)
     {
-        TreeNodeIndex n = list.nodes[i];
-        if (children[n])
+        TreeNodeIndex n   = list.nodes[i];
+        double        sum = 0;
+        for (int k = 0; k < 8; ++k)
         {
-            double* qd  = reinterpret_cast<double*>(q);
-            double  sum = qd[std::size_t(children[n]) * numComponents + threadIdx.x];
-            for (int k = 1; k < 8; ++k)
-            {
-                sum += qd[std::size_t(children[n] + k) * numComponents + threadIdx.x];
-            }
-            qd[std::size_t(n) * numComponents + threadIdx.x] = sum;
+            sum += qd[std::size_t(children[n] + k) * numComponents + threadIdx.x];
         }
+        qd[std::size_t(n) * numComponents + threadIdx.x] = sum;
     }
 }
 
@@ -198,15 +224,31 @@ int main(int argc, char** argv)
                                                                              numNodePeers);
             checkGpuErrors(cudaGetLastError());
         };
-        auto loadNodePeer = [&](int peer, std::span<const TreeNodeIndex> nodes)
+        auto pullNodePeers = [&](std::span<const int> peers, std::span<const TreeNodeIndex> displ,
+                                 std::span<const TreeNodeIndex> nodes)
         {
-            loadNodePeerKernel<<<nodes.size(), numComponents, 0, exec>>>(nodes.data(), peerQ[peer], globQ);
+            if (peers.size() > maxPullMessages)
+            {
+                std::fprintf(stderr, "too many node peers for one pull\n");
+                MPI_Abort(MPI_COMM_WORLD, 1);
+            }
+            PullMessages  msgs;
+            TreeNodeIndex maxNodes = 1;
+            msgs.count             = int(peers.size());
+            for (int i = 0; i < msgs.count; ++i)
+            {
+                msgs.displ[i] = displ[i];
+                msgs.src[i]   = peerQ[peers[i]];
+                maxNodes      = std::max(maxNodes, displ[i + 1] - displ[i]);
+            }
+            msgs.displ[msgs.count] = displ[msgs.count];
+            pullNodePeersKernel<<<dim3(maxNodes, std::max(msgs.count, 1)), numComponents, 0, exec>>>(
+                msgs, nodes.data(), globQ, nodeSignal, nodePeerPes.data(), myPos, numNodePeers, ++numSyncs);
             checkGpuErrors(cudaGetLastError());
         };
         int steps = argc > 1 ? std::atoi(argv[1]) : 10;
         status = testGlobalExchange<DeviceVector>(exec, upsweepFunction, upsweepNodes, rank, numRanks, steps,
-                                                  nodeComm, allocGlobQ, nodeMask(rank, nodeComm), loadNodePeer,
-                                                  scatterNodePeers, syncNode);
+                                                  nodeComm, allocGlobQ, true, pullNodePeers, scatterNodePeers);
     }
     checkGpuErrors(cudaFree(nodePeerQ));
     nvshmem_free(globQ);
