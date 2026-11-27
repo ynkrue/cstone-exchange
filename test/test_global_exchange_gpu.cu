@@ -20,14 +20,22 @@
 
 namespace
 {
-__global__ void sumParents(TreeNodeIndex first, TreeNodeIndex last, const TreeNodeIndex* children, Q* q)
-{
-    TreeNodeIndex i = first + blockIdx.x * blockDim.x + threadIdx.x;
-    if (i < last && children[i]) { q[i] = CombineSum{}(i, children[i], q); }
-}
-
 // one block per node and one thread per component of Q
 constexpr int numComponents = Q{}.size();
+
+//! @brief block b sets node first + b from its children, thread c sums component c, like the M2M kernel of exafmm
+__global__ void sumParents(TreeNodeIndex first, const TreeNodeIndex* children, Q* q)
+{
+    TreeNodeIndex i = first + blockIdx.x;
+    if (children[i] == 0) { return; }
+    const double* qd  = reinterpret_cast<const double*>(q);
+    double        sum = 0;
+    for (int k = 0; k < 8; ++k)
+    {
+        sum += qd[std::size_t(children[i] + k) * numComponents + threadIdx.x];
+    }
+    reinterpret_cast<double*>(q)[std::size_t(i) * numComponents + threadIdx.x] = sum;
+}
 
 //! @brief node nodes[i] of globQ = node nodes[i] of peerQ
 __global__ void loadNodePeerKernel(const TreeNodeIndex* nodes, const Q* peerQ, Q* globQ)
@@ -142,7 +150,7 @@ int main(int argc, char** argv)
                 int n = ranges[l + 1] - ranges[l];
                 if (n > 0)
                 {
-                    sumParents<<<(n + 255) / 256, 256, 0, exec>>>(ranges[l], ranges[l + 1], children, q);
+                    sumParents<<<n, numComponents, 0, exec>>>(ranges[l], children, q);
                     checkGpuErrors(cudaGetLastError());
                 }
             }
